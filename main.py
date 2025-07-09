@@ -82,13 +82,6 @@ filtered_chunks = [c for c in chunks if len(c["content"]) > 100]
 with open("content/chunks.json", "w", encoding="utf-8") as f:
     json.dump(filtered_chunks, f, ensure_ascii=False, indent=2)
 
-print(f"Загружено {len(filtered_chunks)} чанков из {len(chunks)}.")
-
-from sentence_transformers import SentenceTransformer
-import faiss
-import numpy as np
-import json
-
 # Загружаем чанки
 with open("content/chunks.json", encoding="utf-8") as f:
     chunks = json.load(f)
@@ -115,8 +108,6 @@ id_map = {i: chunk for i, chunk in enumerate(chunks)}
 
 with open("content/chunks_map.json", "w", encoding="utf-8") as f:
     json.dump(id_map, f, ensure_ascii=False, indent=2)
-
-print("✅ Индексация завершена. Чанков:", len(chunks))
 
 # Загружаем модель
 model = SentenceTransformer("all-MiniLM-L6-v2")
