@@ -5,7 +5,7 @@ from sentence_transformers import SentenceTransformer
 
 def build_embeddings(chunks: list[dict], model_name="all-MiniLM-L6-v2"):
     model = SentenceTransformer(model_name)
-    texts = [chunk["../content"] for chunk in chunks]
+    texts = [chunk["content"] for chunk in chunks]
     embeddings = model.encode(texts, show_progress_bar=True)
     return model, embeddings
 
