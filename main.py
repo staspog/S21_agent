@@ -74,12 +74,12 @@ def load_documents_from_folder(folder_path):
 
     return all_chunks
 
-chunks = load_documents_from_folder("/content/data")
+chunks = load_documents_from_folder("content/data")
 
 # Фильтрация от слишком маленьких чанков
 filtered_chunks = [c for c in chunks if len(c["content"]) > 100]
 
-with open("/content/chunks.json", "w", encoding="utf-8") as f:
+with open("content/chunks.json", "w", encoding="utf-8") as f:
     json.dump(filtered_chunks, f, ensure_ascii=False, indent=2)
 
 print(f"Загружено {len(filtered_chunks)} чанков из {len(chunks)}.")
@@ -90,7 +90,7 @@ import numpy as np
 import json
 
 # Загружаем чанки
-with open("/content/chunks.json", encoding="utf-8") as f:
+with open("content/chunks.json", encoding="utf-8") as f:
     chunks = json.load(f)
 
 # Загружаем SBERT модель
@@ -108,12 +108,12 @@ index = faiss.IndexFlatL2(dimension)
 index.add(np.array(embeddings))
 
 # Сохраняем индекс
-faiss.write_index(index, "/content/chunks.index")
+faiss.write_index(index, "content/chunks.index")
 
 # Сохраняем сопоставление индексов с ID чанков
 id_map = {i: chunk for i, chunk in enumerate(chunks)}
 
-with open("/content/chunks_map.json", "w", encoding="utf-8") as f:
+with open("content/chunks_map.json", "w", encoding="utf-8") as f:
     json.dump(id_map, f, ensure_ascii=False, indent=2)
 
 print("✅ Индексация завершена. Чанков:", len(chunks))
@@ -122,8 +122,8 @@ print("✅ Индексация завершена. Чанков:", len(chunks))
 model = SentenceTransformer("all-MiniLM-L6-v2")
 
 # Загружаем индекс и сопоставление чанков
-index = faiss.read_index("/content/chunks.index")
-with open("/content/chunks_map.json", encoding="utf-8") as f:
+index = faiss.read_index("content/chunks.index")
+with open("content/chunks_map.json", encoding="utf-8") as f:
     chunks_map = json.load(f)
 
 # Функция поиска ближайших чанков
