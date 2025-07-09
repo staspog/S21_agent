@@ -63,7 +63,6 @@ S21_agent/
 ├── .gitignore            # исключения для Git
 ├── .env.example          # пример переменных окружения
 └── /content
-    ├── /data             # исходные файлы (.md, .txt)
     ├── chunks.json       # извлечённые секции
     ├── chunks_map.json   # сопоставление чанков и ID
     └── chunks.index      # FAISS-индекс
