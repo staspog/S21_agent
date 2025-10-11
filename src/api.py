@@ -4,9 +4,9 @@ from dotenv import load_dotenv
 import os
 
 from sentence_transformers import SentenceTransformer
-from embeddings import load_index_and_map
-from search import find_relevant_chunks, build_prompt
-from gigachat_api import ask_gigachat
+from .embeddings import load_index_and_map
+from .search import find_relevant_chunks, build_prompt
+from .gigachat_api import ask_gigachat
 
 # Загрузка ключа
 load_dotenv()
