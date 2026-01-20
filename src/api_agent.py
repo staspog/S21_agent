@@ -2,8 +2,14 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from dotenv import load_dotenv
+import sys
+from pathlib import Path
 
-from .agents import S21Agent
+# Добавляем корень проекта в путь для импортов
+project_root = Path(__file__).parent.parent
+sys.path.insert(0, str(project_root))
+
+from src.agents import S21Agent
 
 # Загрузка переменных окружения
 load_dotenv()

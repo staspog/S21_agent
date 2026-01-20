@@ -1,5 +1,12 @@
 """Тестовый скрипт для проверки работы LangGraph агента"""
-from .agents import S21Agent
+import sys
+from pathlib import Path
+
+# Добавляем корень проекта в путь для импортов
+project_root = Path(__file__).parent.parent
+sys.path.insert(0, str(project_root))
+
+from src.agents import S21Agent
 
 def main():
     print("Инициализация агента...")
