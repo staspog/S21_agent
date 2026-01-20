@@ -48,7 +48,10 @@ src/
 ### Через API
 
 ```bash
-# Запуск API сервера
+# Запуск API сервера (из корня проекта)
+uvicorn src.api_agent:app --host 0.0.0.0 --port 8000 --reload
+
+# Или из директории src
 cd src
 uvicorn api_agent:app --host 0.0.0.0 --port 8000 --reload
 ```
@@ -73,7 +76,12 @@ print(answer)
 ### Тестирование
 
 ```bash
-python src/test_agent.py
+# Из корня проекта
+python -m src.test_agent
+
+# Или
+cd src
+python test_agent.py
 ```
 
 ## Конфигурация
