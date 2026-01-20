@@ -46,3 +46,5 @@ typing_extensions==4.15.0
 urllib3==2.5.0
 gunicorn
 uvicorn
+langgraph>=0.2.0
+langchain-core>=0.3.0
