@@ -3,6 +3,10 @@ from typing import List, Dict, Optional
 from pathlib import Path
 import json
 
+from ..utils import get_logger
+
+logger = get_logger(__name__)
+
 
 class MockProjectDatabase:
     """Мок базы данных для хранения заданий проектов в markdown формате"""
@@ -14,8 +18,10 @@ class MockProjectDatabase:
         Args:
             data_dir: Директория с данными проектов (опционально)
         """
+        logger.info("Инициализация MockProjectDatabase")
         self.projects: Dict[str, Dict] = {}
         self._load_mock_data()
+        logger.info(f"База данных загружена: {len(self.projects)} проектов")
     
     def _load_mock_data(self):
         """Загружает моковые данные проектов"""
@@ -143,7 +149,13 @@ class MockProjectDatabase:
         Returns:
             Словарь с информацией о проекте или None
         """
-        return self.projects.get(project_name)
+        logger.debug(f"[DB] Поиск проекта: {project_name}")
+        result = self.projects.get(project_name)
+        if result:
+            logger.debug(f"[DB] Проект найден: {project_name}")
+        else:
+            logger.warning(f"[DB] Проект не найден: {project_name}")
+        return result
     
     def get_all_projects(self) -> List[Dict]:
         """
@@ -187,7 +199,14 @@ class MockProjectDatabase:
         Returns:
             Markdown текст с заданиями или None
         """
+        logger.debug(f"[DB] Получение заданий для проекта: {project_name}")
         project = self.get_project(project_name)
         if project:
-            return project.get("tasks", "")
+            tasks = project.get("tasks", "")
+            if tasks:
+                logger.debug(f"[DB] Задания получены для {project_name} (длина: {len(tasks)} символов)")
+            else:
+                logger.warning(f"[DB] Задания пусты для проекта: {project_name}")
+            return tasks
+        logger.warning(f"[DB] Проект не найден для получения заданий: {project_name}")
         return None

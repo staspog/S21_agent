@@ -25,10 +25,21 @@ def main():
         print(f"Вопрос: {query}")
         print("-" * 50)
         try:
-            answer = agent.invoke(query)
-            print(f"Ответ: {answer}")
+            result = agent.invoke(query)
+            # Новый API возвращает словарь
+            if isinstance(result, dict):
+                answer = result.get("answer", "")
+                if result.get("needs_input"):
+                    print(f"Вопрос агента: {result.get('question', '')}")
+                else:
+                    print(f"Ответ: {answer}")
+            else:
+                # Старый формат (на случай если что-то пошло не так)
+                print(f"Ответ: {result}")
         except Exception as e:
             print(f"Ошибка: {e}")
+            import traceback
+            traceback.print_exc()
         print("\n" + "=" * 50 + "\n")
 
 if __name__ == "__main__":

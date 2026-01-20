@@ -1,8 +1,12 @@
 """LLM клиент для работы с GigaChat"""
 from typing import List, Dict, Optional
+import time
 from gigachat import GigaChat
 from gigachat.models import Chat, Messages
 from ..config import GIGACHAT_API_KEY, LLM_TEMPERATURE
+from ..utils import get_logger
+
+logger = get_logger(__name__)
 
 
 class LLMClient:
@@ -25,6 +29,14 @@ class LLMClient:
         Returns:
             Ответ от LLM
         """
+        start_time = time.time()
+        prompt_preview = prompt[:200] + "..." if len(prompt) > 200 else prompt
+        
+        logger.debug(f"[LLM] Вызов GigaChat API")
+        logger.debug(f"[LLM] Промпт (первые 200 символов): {prompt_preview}")
+        if system_prompt:
+            logger.debug(f"[LLM] Системный промпт: {system_prompt[:100]}")
+        
         messages = []
         
         if system_prompt:
@@ -32,10 +44,22 @@ class LLMClient:
         
         messages.append({"role": "user", "content": prompt})
         
-        with GigaChat(credentials=self.api_key, verify_ssl_certs=False) as giga:
-            chat = Chat(messages=messages)
-            response = giga.chat(chat)
-            return response.choices[0].message.content
+        try:
+            with GigaChat(credentials=self.api_key, verify_ssl_certs=False) as giga:
+                chat = Chat(messages=messages)
+                response = giga.chat(chat)
+                result = response.choices[0].message.content
+                
+                elapsed = time.time() - start_time
+                result_preview = result[:200] + "..." if len(result) > 200 else result
+                logger.info(f"[LLM] Ответ получен (время: {elapsed:.3f}s, длина: {len(result)} символов)")
+                logger.debug(f"[LLM] Ответ (первые 200 символов): {result_preview}")
+                
+                return result
+        except Exception as e:
+            elapsed = time.time() - start_time
+            logger.error(f"[LLM] Ошибка при вызове GigaChat API: {e} (время: {elapsed:.3f}s)")
+            raise
     
     def invoke_structured(self, prompt: str, system_prompt: Optional[str] = None, 
                          response_format: Optional[str] = None) -> str:
