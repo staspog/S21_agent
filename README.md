@@ -1,10 +1,10 @@
 # S21 Agent — Чат-бот с GigaChat и FAISS
 
-RAG-система на основе моделей SentenceTransformers и GigaChat, использующий `.md` и `.txt` файлы как контекст. Эмбеддинги индексируются с помощью FAISS. На данный момент знает о проектах на Си, DS_Bootcamp, а также ML_Project_1.
+RAG-система на основе SentenceTransformers и GigaChat с оркестрацией через LangGraph и памятью диалога в рамках сессии (`session_id` / checkpoint по `thread_id`). Контекст берётся из проиндексированных `.md` и `.txt` файлов; поиск по FAISS.
 
 ---
 
-## ⚙️ Установка окружения (Python 3.10)
+## Установка окружения (Python 3.10+)
 
 ### 1. Клонируйте репозиторий
 
@@ -15,21 +15,19 @@ cd S21_agent
 
 ### 2. Создайте виртуальное окружение и активируйте его
 
-- **Для Windows (PowerShell):**
+- **Windows (PowerShell):**
 
 ```powershell
 python -m venv venv
 .\venv\Scripts\activate
 ```
 
-- **Для Windows (Git Bash) / WSL / Linux / macOS:**
+- **Windows (Git Bash) / WSL / Linux / macOS:**
 
 ```bash
 python -m venv venv
-source venv/Scripts/activate
+source venv/bin/activate
 ```
-
-> На macOS и Linux активация виртуального окружения происходит через `source venv/bin/activate`.
 
 ### 3. Установите зависимости
 
@@ -41,106 +39,91 @@ pip install -r requirements.txt
 ### 4. Получение API ключа GigaChat
 
 - Зарегистрируйтесь или войдите на платформу GigaChat (https://gigachat.ai или другой официальный сайт сервиса).
-- В личном кабинете найдите раздел управления API ключами.
-- Создайте новый API ключ и скопируйте его.
+- В личном кабинете создайте API ключ.
 
-### 5. Настройте переменные окружения
+### 5. Переменные окружения
 
-В корне проекта создайте файл `.env` и добавьте в него строку:
+В корне проекта создайте файл `.env`:
 
 ```env
 GIGACHAT_API_KEY=ваш_ключ_от_gigachat
 ```
 
-> **Важно:** файл `.env` добавлен в `.gitignore`, чтобы ваши ключи не попали в публичный репозиторий.
+> Файл `.env` в `.gitignore`, ключи не попадают в репозиторий.
 
 ---
 
-## 🚀 Запуск приложения
+## Запуск
 
-### Консольная версия чат-бота
+### API-сервер (FastAPI)
 
-Запустите чат-бота в интерактивном режиме командой:
+Из корня репозитория (обязательно — иначе ломаются относительные импорты в `src.api`):
 
 ```bash
-python src/main.py
+python main.py
 ```
 
-Если в папке `/content/data` нет уже готовых JSON-файлов с чанками (`chunks.json`, `chunks_map.json`, `chunks.index`), бот проиндексирует `.md` и `.txt` файлы из этой папки и начнёт принимать вопросы.
-Если JSON-файлы с чанками присутствуют — бот загрузит их и будет использовать для ответов.
+Переменные окружения (необязательно): `HOST`, `PORT`, `UVICORN_RELOAD` (`0` / `false` — без auto-reload).
 
----
-
-### Запуск API сервера
-
-Выполните команды:
+Альтернатива:
 
 ```bash
-cd src
-uvicorn api:app --host 0.0.0.0 --port 8000 --reload
+uvicorn src.api:app --host 0.0.0.0 --port 8000 --reload
 ```
 
-Это запустит сервер с API, который отвечает на следующие эндпоинты:
+Не запускайте `uvicorn api:app` из каталога `src` — модуль окажется вне пакета и импорт `from .agent_graph` упадёт.
 
-- `/docs` — автоматически сгенерированная документация Swagger UI
-- `/ask/` — основной эндпоинт для вопросов к чат-боту
+Эндпоинты:
 
----
+- `/docs` — Swagger UI
+- `POST /ask` — вопрос к боту; тело JSON: `question`, опционально `top_k`, опционально `session_id` (если не указан, сервер создаст новый и вернёт в ответе)
 
-### Клиент для работы с API
+### Клиент для проверки API
 
-Для взаимодействия с API запустите:
+С запущенным сервером:
 
 ```bash
-python src/client.py
+python src/test_client.py
 ```
 
-Он позволит отправлять вопросы и получать ответы через HTTP-запросы к серверу.
+Клиент создаёт один `session_id` на время работы, чтобы сохранялся контекст диалога.
 
 ---
 
-## 📁 Структура проекта
+## Структура проекта
 
 ```
 S21_agent/
+├── main.py               # точка входа: python main.py
 ├── src/
-│   ├── main.py           # консольный запуск чат-бота
-│   ├── api.py            # API сервер на FastAPI
-│   ├── client.py         # клиент для работы с API
-│   └── ...
-├── requirements.txt      # зависимости
-├── .gitignore            # исключения для Git
-├── .env.example          # пример переменных окружения
-└── content/
-    └── data/             # папка для .md и .txt файлов с контекстом
+│   ├── api.py              # FastAPI, вызов LangGraph
+│   ├── agent_graph.py      # граф RAG (retrieve → generate)
+│   ├── embeddings.py       # FAISS и карта чанков
+│   ├── search.py           # поиск чанков по запросу
+│   ├── data_loader.py      # загрузка документов для индексации
+│   └── test_client.py      # простой HTTP-клиент
+├── requirements.txt
+├── Dockerfile
+└── content/                # индекс и данные (chunks.index, chunks_map.json, data/ …)
 ```
 
 ---
 
-## 📌 Зависимости
+## Зависимости
 
-Все зависимости перечислены в `requirements.txt`. Используются:
+Основное перечислено в `requirements.txt`, в том числе:
 
-* `sentence-transformers`
-* `faiss-cpu`
-* `gigachat`
-* `fastapi`
-* `uvicorn`
-* `markdown`, `uuid`, `dotenv`, `numpy`, `json`
+- `sentence-transformers`, `faiss-cpu`
+- `fastapi`, `uvicorn`
+- `langgraph`, `langchain-gigachat`, `langchain-core`
+- `python-dotenv`
 
 ---
 
-## 🔐 Безопасность
+## Безопасность
 
-* Файл `.env` добавлен в `.gitignore` и не попадает в репозиторий.
-* Ключи API загружаются безопасно через библиотеку `python-dotenv`.
-* Если не хотите хранить `.env`, можно использовать безопасный ввод ключа в консоли:
-
-```python
-from getpass import getpass
-api_key = getpass("Введите ключ: ")
-```
+- `.env` не коммитится; ключи подхватываются через `python-dotenv`.
 
 ---
 
-© 2025 — S21 School Assistant
+© 2026 — S21 School Assistant
