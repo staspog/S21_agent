@@ -29,4 +29,5 @@ EXPOSE 8000
 # Запускаем приложение из папки /app, поэтому путь к модулю будет src.api
 # Используем gunicorn как более надежный и производительный сервер для продакшена.
 # `uvicorn ... --reload` — это сервер для разработки.
-CMD ["gunicorn", "-w", "4", "-k", "uvicorn.workers.UvicornWorker", "-b", "0.0.0.0:8000", "src.api:app"]
+# Один воркер: MemorySaver в памяти процесса; при -w>1 сессии разъехались бы по воркерам.
+CMD ["gunicorn", "-w", "1", "-k", "uvicorn.workers.UvicornWorker", "-b", "0.0.0.0:8000", "src.api:app"]
