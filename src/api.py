@@ -1,16 +1,26 @@
+"""FastAPI: один эндпоинт /ask поверх Rocket.Chat-агента."""
+
+from __future__ import annotations
+
+import asyncio
 import logging
 import os
 import time
 import uuid
+from contextlib import asynccontextmanager
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
 from langchain_core.messages import HumanMessage
-from pydantic import BaseModel
-from sentence_transformers import SentenceTransformer
+from langchain_gigachat.chat_models import GigaChat
+from pydantic import BaseModel, Field
 
-from .agent_graph import build_rag_graph, chunk_sources
-from .embeddings import load_index_and_map
+from .graph import build_rc_graph
+from .llm_gate import get_default_gate
+from .pipeline.rerank import warmup_reranker
+from .rc.catalog import RoomCatalog
+from .rc.client import RocketChatClient
+from .rc.config import load_rc_config
 
 
 def _setup_logging() -> None:
@@ -26,20 +36,57 @@ def _setup_logging() -> None:
 
 
 _setup_logging()
-log = logging.getLogger("s21.agent")
+log = logging.getLogger("s21.api")
 
 load_dotenv()
+
 api_key = os.getenv("GIGACHAT_API_KEY")
 if not api_key:
     raise RuntimeError("GIGACHAT_API_KEY не найден в .env")
 
-log.info("Загружаем модель эмбеддингов и FAISS индекс...")
-model = SentenceTransformer("all-MiniLM-L6-v2")
-index, chunks_map = load_index_and_map()
-graph = build_rag_graph(model, index, chunks_map, api_key)
-log.info("Готово к приёму запросов.")
+rc_cfg = load_rc_config()
+rc_client = RocketChatClient(rc_cfg)
+rc_catalog = RoomCatalog(rc_client, rc_cfg)
+llm = GigaChat(
+    credentials=api_key,
+    verify_ssl_certs=False,
+    timeout=60,
+)
+get_default_gate()  # инициализация singleton до первой LLM-нагрузки
+graph = build_rc_graph(
+    llm=llm,
+    rc_client=rc_client,
+    rc_catalog=rc_catalog,
+    rc_cfg=rc_cfg,
+)
+log.info("Граф собран. Reranker=%s", rc_cfg.reranker_model)
 
-app = FastAPI(title="S21 Agent API")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Прогрев каталога и реранкера в фоне (не блокируем старт).
+    async def _bg():
+        try:
+            await rc_catalog.get()
+        except Exception:
+            log.exception("startup: каталог комнат не подгрузился, попробуем позже")
+        try:
+            await asyncio.get_running_loop().run_in_executor(
+                None, lambda: warmup_reranker(rc_cfg.reranker_model)
+            )
+        except Exception:
+            log.exception("startup: warmup реранкера упал")
+
+    asyncio.create_task(_bg())
+    log.info("API готов к приёму запросов")
+    try:
+        yield
+    finally:
+        await rc_client.aclose()
+        log.info("API остановлен, RC-клиент закрыт")
+
+
+app = FastAPI(title="S21 RC Agent API", lifespan=lifespan)
 
 
 @app.middleware("http")
@@ -58,10 +105,11 @@ async def log_http_requests(request: Request, call_next):
 
 
 class QueryRequest(BaseModel):
-    question: str
-    top_k: int = 3
+    question: str = Field(min_length=1)
     session_id: str | None = None
-    include_sources: bool = False
+    include_sources: bool = True
+    # Сохраняем старое имя поля для совместимости с test_client.py — игнорируется.
+    top_k: int | None = Field(default=None, exclude=True)
 
 
 class QueryResponse(BaseModel):
@@ -71,27 +119,18 @@ class QueryResponse(BaseModel):
 
 
 @app.post("/ask", response_model=QueryResponse)
-def ask_question(request: QueryRequest):
+async def ask_question(request: QueryRequest):
     session_id = request.session_id or str(uuid.uuid4())
-    q_len = len(request.question)
     log.info(
-        "ask start session_id=%s top_k=%s question_len=%s include_sources=%s",
+        "ask start session_id=%s question_len=%s include_sources=%s",
         session_id,
-        request.top_k,
-        q_len,
+        len(request.question),
         request.include_sources,
     )
     t0 = time.perf_counter()
     try:
-        log.info(
-            "graph invoke: узлы START → retrieve → generate → END | thread_id=%s",
-            session_id,
-        )
-        result = graph.invoke(
-            {
-                "messages": [HumanMessage(content=request.question)],
-                "top_k": request.top_k,
-            },
+        result = await graph.ainvoke(
+            {"messages": [HumanMessage(content=request.question)]},
             {"configurable": {"thread_id": session_id}},
         )
         elapsed = time.perf_counter() - t0
@@ -100,18 +139,30 @@ def ask_question(request: QueryRequest):
         answer = getattr(last, "content", "") or ""
         if not isinstance(answer, str):
             answer = str(answer)
-        sources = None
+
+        sources: list[str] | None = None
         if request.include_sources:
-            sources = chunk_sources(list(result.get("retrieved_chunks") or []))
+            srcs = list(result.get("final_sources") or [])
+            seen: set[str] = set()
+            sources = []
+            for s in srcs:
+                if s and s not in seen:
+                    seen.add(s)
+                    sources.append(s)
+
         log.info(
-            "ask done session_id=%s graph_s=%.3f answer_len=%s",
+            "ask done session_id=%s graph_s=%.3f answer_len=%s sources=%s",
             session_id,
             elapsed,
             len(answer),
+            len(sources or []),
         )
-        return QueryResponse(
-            answer=answer, session_id=session_id, sources=sources
-        )
+        return QueryResponse(answer=answer, session_id=session_id, sources=sources)
     except Exception as e:
         log.exception("ask failed session_id=%s", session_id)
         raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.get("/health")
+async def health() -> dict:
+    return {"status": "ok"}

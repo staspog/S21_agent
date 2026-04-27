@@ -1,0 +1,193 @@
+"""Pydantic v2 схемы для Rocket.Chat пайплайна.
+
+Здесь лежат все типы, которые ходят между узлами LangGraph, а также
+структуры для structured output LLM (decompose, select_rooms, expand_query).
+"""
+
+from __future__ import annotations
+
+from typing import Literal
+
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+
+RoomKind = Literal["channel", "group", "im"]
+
+
+class Room(BaseModel):
+    """Комната Rocket.Chat (канал, приватная группа или DM)."""
+
+    model_config = ConfigDict(frozen=True)
+
+    rid: str = Field(description="Внутренний идентификатор комнаты")
+    name: str = Field(description="Имя комнаты (без #)")
+    kind: RoomKind = Field(description="Тип: channel | group | im")
+    topic: str = Field(default="", description="Topic/описание комнаты")
+
+    @field_validator("rid", "name")
+    @classmethod
+    def _strip(cls, v: str) -> str:
+        s = (v or "").strip()
+        if not s:
+            raise ValueError("Field must not be empty")
+        return s
+
+
+class Hit(BaseModel):
+    """Нормализованное сообщение Rocket.Chat — единица evidence для ответа."""
+
+    model_config = ConfigDict(frozen=False)
+
+    mid: str = Field(description="Rocket.Chat message id")
+    rid: str = Field(description="Идентификатор комнаты")
+    room_name: str = Field(description="Имя комнаты")
+    room_kind: RoomKind = Field(default="group")
+    msg: str = Field(default="", description="Текст сообщения")
+    ts: str = Field(default="", description="ISO timestamp")
+    user: str = Field(default="", description="Username автора")
+    rc_score: float | None = Field(default=None, description="score от chat.search")
+    bm25_score: float | None = None
+    ce_score: float | None = None
+    final_score: float | None = None
+    thread_root_mid: str | None = Field(
+        default=None,
+        description="Для реплая — id корневого сообщения треда",
+    )
+    is_thread_reply: bool = False
+    permalink: str = Field(default="", description="Веб-ссылка на сообщение")
+
+
+class SubqueryPlan(BaseModel):
+    """Structured output: 1..N подвопросов, на которые LLM раскладывает запрос."""
+
+    subqueries: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Список самостоятельных подвопросов (1..N). "
+            "Каждый — короткое утверждение/вопрос на русском языке."
+        ),
+    )
+
+    @field_validator("subqueries")
+    @classmethod
+    def _normalize(cls, v: list[str]) -> list[str]:
+        out: list[str] = []
+        seen: set[str] = set()
+        for x in v or []:
+            s = (x or "").strip().strip('"').strip("'").strip()
+            if not s:
+                continue
+            key = s.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(s)
+        return out[:5]
+
+
+class RoomSelection(BaseModel):
+    """Structured output: выбор комнат для одного подвопроса."""
+
+    selected_rids: list[str] = Field(
+        default_factory=list,
+        description="Идентификаторы комнат (rid), отобранные по релевантности подвопросу",
+    )
+    reasoning: str = Field(
+        default="",
+        description="Короткое обоснование (1–2 фразы), только для логов",
+    )
+
+    @field_validator("selected_rids")
+    @classmethod
+    def _normalize(cls, v: list[str]) -> list[str]:
+        out: list[str] = []
+        seen: set[str] = set()
+        for x in v or []:
+            s = (x or "").strip()
+            if s and s not in seen:
+                seen.add(s)
+                out.append(s)
+        return out[:8]
+
+
+class SearchQueries(BaseModel):
+    """Structured output: 2..4 коротких поисковых строки (1–3 слова) для chat.search."""
+
+    queries: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Поисковые строки 1–3 слова. Существительные/имена в нормальной форме, "
+            "без знаков препинания и кавычек."
+        ),
+    )
+
+    @field_validator("queries")
+    @classmethod
+    def _normalize(cls, v: list[str]) -> list[str]:
+        out: list[str] = []
+        seen: set[str] = set()
+        for x in v or []:
+            s = (x or "").strip().strip('"').strip("'").strip()
+            if not s:
+                continue
+            key = s.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(s)
+        return out[:6]
+
+
+class Evidence(BaseModel):
+    """Доказательная база для одного подвопроса (после rerank-а и треда)."""
+
+    model_config = ConfigDict(frozen=False)
+
+    subquery: str
+    hits: list[Hit] = Field(default_factory=list)
+
+
+class FinalAnswer(BaseModel):
+    """Structured output финальной генерации.
+
+    Разделяем «то, что показываем пользователю» и «то, по чему сервер строит блок
+    Источники». Так пользователь видит чистый markdown без технических меток
+    `[rc:<mid>]`, а сервер знает, какие сообщения цитировались, и сам подставляет
+    блок «## Источники».
+    """
+
+    answer_markdown: str = Field(
+        description=(
+            "Markdown-ответ на русском языке для пользователя.\n"
+            "СТРОГО:\n"
+            "  • НЕ вставляй технические метки вида [rc:<mid>], [rc=<mid>], "
+            "[mid:<...>] и подобные;\n"
+            "  • НЕ добавляй блок 'Источники' / 'Ссылки' / 'Permalink' — "
+            "сервер подставит его сам;\n"
+            "  • не дублируй текст EVIDENCE дословно длинными цитатами — "
+            "пересказывай;\n"
+            "  • если для подвопроса в EVIDENCE нет данных — честно скажи "
+            "'в доступных сообщениях нет данных'."
+        )
+    )
+    cited_mids: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Список mid сообщений из EVIDENCE, на которые опирается ответ. "
+            "Только реальные mid, встречающиеся в EVIDENCE. Без выдуманных. "
+            "Порядок — по релевантности/использованию в ответе."
+        ),
+    )
+
+    @field_validator("cited_mids")
+    @classmethod
+    def _normalize_mids(cls, v: list[str]) -> list[str]:
+        out: list[str] = []
+        seen: set[str] = set()
+        for x in v or []:
+            s = (x or "").strip()
+            if not s or s in seen:
+                continue
+            seen.add(s)
+            out.append(s)
+        return out
