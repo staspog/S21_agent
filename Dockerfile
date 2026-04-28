@@ -1,33 +1,35 @@
-# Этап 1: Определение базового образа
-# Используем официальный "тонкий" образ Python. Укажите версию, которую используете в проекте.
-FROM python:3.10-slim
+# Образ для нового приложения: FastAPI + Rocket.Chat search pipeline.
+# Локальные индексы и файлы старого пайплайна в образ больше не копируются.
+FROM python:3.11-slim
 
-# Этап 2: Установка рабочей директории внутри контейнера
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONIOENCODING=UTF-8 \
+    PIP_NO_CACHE_DIR=1 \
+    HF_HOME=/app/.cache/huggingface \
+    TRANSFORMERS_CACHE=/app/.cache/huggingface
+
 WORKDIR /app
 
-# Этап 3: Установка зависимостей
-# Копируем только requirements.txt, чтобы Docker мог кэшировать этот слой.
-# Установка зависимостей не будет повторяться при каждом изменении кода.
+# Runtime-библиотеки нужны для torch/sentence-transformers и HTTPS-запросов.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --upgrade pip \
+    && pip install -r requirements.txt
 
-# Этап 4: Копирование кода и данных
-# Копируем папку с исходным кодом и папку с данными
 COPY ./src ./src
-COPY ./content ./content
+COPY ./main.py ./main.py
 
-# ВАЖНО: Рекомендация для production
-# Включать большие файлы данных (chunks.index, chunks_map.json) в образ — не лучшая практика.
-# В реальном продакшене их лучше загружать из облачного хранилища (S3, Google Cloud Storage)
-# при старте контейнера. Но для простоты сейчас мы их скопируем.
+RUN useradd --create-home --shell /usr/sbin/nologin appuser \
+    && mkdir -p /app/.cache/huggingface \
+    && chown -R appuser:appuser /app
+USER appuser
 
-# Этап 5: Указание порта
-# Сообщаем Docker, что приложение внутри контейнера будет работать на порту 8000
 EXPOSE 8000
 
-# Этап 6: Команда для запуска приложения
-# Запускаем приложение из папки /app, поэтому путь к модулю будет src.api
-# Используем gunicorn как более надежный и производительный сервер для продакшена.
-# `uvicorn ... --reload` — это сервер для разработки.
-# Один воркер: MemorySaver в памяти процесса; при -w>1 сессии разъехались бы по воркерам.
-CMD ["gunicorn", "-w", "1", "-k", "uvicorn.workers.UvicornWorker", "-b", "0.0.0.0:8000", "src.api:app"]
+# Один воркер: MemorySaver хранит историю в памяти процесса.
+# Timeout выше стандартного 30s: RC-поиск + reranker + GigaChat могут отвечать дольше.
+CMD ["gunicorn", "-w", "1", "-k", "uvicorn.workers.UvicornWorker", "-b", "0.0.0.0:8000", "--timeout", "300", "src.api:app"]
