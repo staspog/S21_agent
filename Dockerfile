@@ -11,21 +11,23 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-# Runtime-библиотеки нужны для torch/sentence-transformers и HTTPS-запросов.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates libgomp1 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
+# CPU-only PyTorch: на Linux иначе тянется torch+cuda (nvidia_*, triton…) — гигабайты и долгий шаг «Installing collected packages».
 RUN pip install --upgrade pip \
+    && pip install --index-url https://download.pytorch.org/whl/cpu "torch==2.11.0" \
     && pip install -r requirements.txt
 
 COPY ./src ./src
 COPY ./main.py ./main.py
 
-RUN useradd --create-home --shell /usr/sbin/nologin appuser \
+RUN groupadd --gid 1000 appgroup \
+    && useradd --uid 1000 --gid appgroup --create-home --shell /usr/sbin/nologin appuser \
     && mkdir -p /app/.cache/huggingface \
-    && chown -R appuser:appuser /app
+    && chown -R appuser:appgroup /app
 USER appuser
 
 EXPOSE 8000

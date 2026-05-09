@@ -48,8 +48,8 @@ class RocketChatConfig:
     password: str
 
     # HTTP
-    timeout_connect_s: float = 5.0
-    timeout_read_s: float = 30.0
+    timeout_connect_s: float = 10.0
+    timeout_read_s: float = 240.0
     http_concurrency: int = 8
 
     # Catalog
@@ -97,8 +97,8 @@ def load_rc_config() -> RocketChatConfig:
         base_url=base,
         user=user,
         password=password,
-        timeout_connect_s=_env_float("RC_TIMEOUT_CONNECT_S", 5.0),
-        timeout_read_s=_env_float("RC_TIMEOUT_READ_S", 30.0),
+        timeout_connect_s=_env_float("RC_TIMEOUT_CONNECT_S", 10.0),
+        timeout_read_s=_env_float("RC_TIMEOUT_READ_S", 240.0),
         http_concurrency=_env_int("RC_HTTP_CONCURRENCY", 8),
         catalog_ttl_s=_env_int("RC_CATALOG_TTL_S", 600),
         catalog_page_size=_env_int("RC_CATALOG_PAGE_SIZE", 50),

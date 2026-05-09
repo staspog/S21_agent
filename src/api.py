@@ -61,6 +61,15 @@ graph = build_rc_graph(
 )
 log.info("Граф собран. Reranker=%s", rc_cfg.reranker_model)
 
+_ASK_TIMEOUT_RAW = os.environ.get("ASK_TIMEOUT_S", "300").strip()
+try:
+    ASK_TIMEOUT_S = float(_ASK_TIMEOUT_RAW)
+except ValueError:
+    ASK_TIMEOUT_S = 300.0
+if ASK_TIMEOUT_S <= 0:
+    ASK_TIMEOUT_S = 300.0
+log.info("ASK_TIMEOUT_S=%s (504 если граф дольше)", ASK_TIMEOUT_S)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -129,9 +138,12 @@ async def ask_question(request: QueryRequest):
     )
     t0 = time.perf_counter()
     try:
-        result = await graph.ainvoke(
-            {"messages": [HumanMessage(content=request.question)]},
-            {"configurable": {"thread_id": session_id}},
+        result = await asyncio.wait_for(
+            graph.ainvoke(
+                {"messages": [HumanMessage(content=request.question)]},
+                {"configurable": {"thread_id": session_id}},
+            ),
+            timeout=ASK_TIMEOUT_S,
         )
         elapsed = time.perf_counter() - t0
         messages = result["messages"]
@@ -158,6 +170,18 @@ async def ask_question(request: QueryRequest):
             len(sources or []),
         )
         return QueryResponse(answer=answer, session_id=session_id, sources=sources)
+    except TimeoutError:
+        elapsed = time.perf_counter() - t0
+        log.warning(
+            "ask timeout session_id=%s limit_s=%.3f elapsed_s=%.3f",
+            session_id,
+            ASK_TIMEOUT_S,
+            elapsed,
+        )
+        raise HTTPException(
+            status_code=504,
+            detail="Ask processing timed out",
+        ) from None
     except Exception as e:
         log.exception("ask failed session_id=%s", session_id)
         raise HTTPException(status_code=500, detail=str(e)) from e

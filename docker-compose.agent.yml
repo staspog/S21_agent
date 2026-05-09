@@ -1,0 +1,74 @@
+version: "3.8"
+
+services:
+  s21_agent:
+    build: .
+    image: s21_agent:latest
+    container_name: s21_agent
+    expose:
+      - "8000"
+    environment:
+      - GIGACHAT_API_KEY=${GIGACHAT_API_KEY:-}
+      - ROCKETCHAT_BASE_URL=${ROCKETCHAT_BASE_URL:-}
+      - ROCKETCHAT_USER=${ROCKETCHAT_USER:-}
+      - ROCKETCHAT_PASSWORD=${ROCKETCHAT_PASSWORD:-}
+      - RC_TIMEOUT_CONNECT_S=${RC_TIMEOUT_CONNECT_S:-}
+      - RC_TIMEOUT_READ_S=${RC_TIMEOUT_READ_S:-}
+      - RC_HTTP_CONCURRENCY=${RC_HTTP_CONCURRENCY:-}
+      - RC_CATALOG_TTL_S=${RC_CATALOG_TTL_S:-}
+      - RC_CATALOG_PAGE_SIZE=${RC_CATALOG_PAGE_SIZE:-}
+      - RC_CATALOG_MAX_ROOMS=${RC_CATALOG_MAX_ROOMS:-}
+      - RC_ALWAYS_SEARCH_ROOMS=${RC_ALWAYS_SEARCH_ROOMS:-}
+      - RC_MAX_SUBQUERIES=${RC_MAX_SUBQUERIES:-}
+      - RC_ROOMS_PER_SUBQUERY=${RC_ROOMS_PER_SUBQUERY:-}
+      - RC_QUERIES_PER_SUBQUERY=${RC_QUERIES_PER_SUBQUERY:-}
+      - RC_SEARCH_COUNT=${RC_SEARCH_COUNT:-}
+      - RC_RERANK_TOP_N=${RC_RERANK_TOP_N:-}
+      - RC_BM25_WEIGHT=${RC_BM25_WEIGHT:-}
+      - RC_THREAD_EXPAND_TOP=${RC_THREAD_EXPAND_TOP:-}
+      - RC_THREAD_MESSAGES_COUNT=${RC_THREAD_MESSAGES_COUNT:-}
+      - RC_RERANKER_MODEL=${RC_RERANKER_MODEL:-}
+      - ASK_TIMEOUT_S=${ASK_TIMEOUT_S:-}
+    volumes:
+      # Код из rsync на хосте; образ держит только зависимости (сборка только при смене Dockerfile/requirements).
+      - ./src:/app/src:ro
+      - ./main.py:/app/main.py:ro
+    restart: unless-stopped
+    networks:
+      - s21_agent_network
+
+  s21_agent_edge:
+    image: nginx:alpine
+    container_name: s21_agent_edge
+    depends_on:
+      - s21_agent
+    ports:
+      # Только localhost: внешний HTTPS — хостовый nginx.
+      - "127.0.0.1:${AGENT_EDGE_PORT:-8000}:8000"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx-entrypoint.sh:/docker-entrypoint.d/nginx-entrypoint.sh:ro
+    environment:
+      - TLS_DISABLED=${TLS_DISABLED:-false}
+      - AGENT_APP_HOST=${AGENT_APP_HOST:-s21_agent}
+      - AGENT_APP_PORT=${AGENT_APP_PORT:-8000}
+      - TLS_CERT_PEM_BASE64=${TLS_CERT_PEM_BASE64:-}
+      - TLS_KEY_PEM_BASE64=${TLS_KEY_PEM_BASE64:-}
+    entrypoint: ["/bin/sh", "/docker-entrypoint.d/nginx-entrypoint.sh"]
+    restart: unless-stopped
+    networks:
+      - s21_agent_network
+      - s21_internal_bridge
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:8000/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 45s
+
+networks:
+  s21_agent_network:
+    driver: bridge
+  s21_internal_bridge:
+    name: s21_internal_bridge
+    external: true
