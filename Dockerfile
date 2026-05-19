@@ -24,6 +24,7 @@ RUN pip install --upgrade pip \
 
 COPY ./src ./src
 COPY ./main.py ./main.py
+COPY ./faiss_store ./faiss_store
 
 RUN groupadd --gid 1000 appgroup \
     && useradd --uid 1000 --gid appgroup --create-home --shell /usr/sbin/nologin appuser \
