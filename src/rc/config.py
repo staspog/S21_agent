@@ -56,7 +56,34 @@ class RocketChatConfig:
     catalog_ttl_s: int = 600
     catalog_page_size: int = 50
     catalog_max_rooms: int = 200
-    always_search_room_names: tuple[str, ...] = ("msk_adm",)
+    # Топ-каналы по usersCount (channels.list), фиксируем константой.
+    # В этом режиме агент всегда ищет по одному и тому же набору комнат.
+    always_search_room_names: tuple[str, ...] = (
+        "product_feedback",
+        "product_info",
+        "s21_feedback",
+        "content_help",
+        "general",
+        "PIN_info",
+        "msk_general",
+        "dir_talks",
+        "Natasha_is_listening",
+        "kzn_volunteers",
+        "Internship_kzn",
+        "contests",
+        "tas_adm",
+        "skd_adm",
+        "cybersec_21",
+        "lab_kzn",
+        "chgk",
+        "Buddy-komandy",
+        "ft_memes",
+        "nn_helpers",
+        "random",
+        "born_to_code",
+        "Random_coffee",
+        "SQL",
+    )
 
     # Pipeline
     max_subqueries: int = 5
@@ -103,7 +130,6 @@ def load_rc_config() -> RocketChatConfig:
         catalog_ttl_s=_env_int("RC_CATALOG_TTL_S", 600),
         catalog_page_size=_env_int("RC_CATALOG_PAGE_SIZE", 50),
         catalog_max_rooms=_env_int("RC_CATALOG_MAX_ROOMS", 200),
-        always_search_room_names=_env_csv("RC_ALWAYS_SEARCH_ROOMS", ("msk_adm",)),
         max_subqueries=_env_int("RC_MAX_SUBQUERIES", 5),
         rooms_per_subquery=_env_int("RC_ROOMS_PER_SUBQUERY", 4),
         queries_per_subquery=_env_int("RC_QUERIES_PER_SUBQUERY", 3),

@@ -8,6 +8,7 @@ import os
 import time
 import uuid
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
@@ -17,6 +18,7 @@ from pydantic import BaseModel, Field
 
 from .graph import build_rc_graph
 from .llm_gate import get_default_gate
+from .pipeline.rag_faiss import RagConfig, load_rag_assets
 from .pipeline.rerank import warmup_reranker
 from .rc.catalog import RoomCatalog
 from .rc.client import RocketChatClient
@@ -50,8 +52,15 @@ rc_catalog = RoomCatalog(rc_client, rc_cfg)
 llm = GigaChat(
     credentials=api_key,
     verify_ssl_certs=False,
-    timeout=60,
+    model="GigaChat-2-Max",
+    scope="GIGACHAT_API_CORP",
+    timeout=600,
 )
+try:
+    logging.info(f"available LLM models: {llm.get_models()}")
+except Exception as e:
+    logging.error(f"Error: {e}")
+    raise e
 get_default_gate()  # инициализация singleton до первой LLM-нагрузки
 graph = build_rc_graph(
     llm=llm,
@@ -85,6 +94,13 @@ async def lifespan(app: FastAPI):
             )
         except Exception:
             log.exception("startup: warmup реранкера упал")
+        try:
+            rag_cfg = RagConfig.from_env()
+            await asyncio.get_running_loop().run_in_executor(
+                None, lambda: load_rag_assets(rag_cfg)
+            )
+        except Exception:
+            log.exception("startup: RAG assets preload failed")
 
     asyncio.create_task(_bg())
     log.info("API готов к приёму запросов")

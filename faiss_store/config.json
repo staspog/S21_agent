@@ -1,0 +1,12 @@
+{
+  "model": "intfloat/multilingual-e5-small",
+  "index_type": "IndexFlatIP",
+  "dim": 384,
+  "normalize_embeddings": true,
+  "chunk_files": [
+    "docs/tonihuy_faq_chunks.jsonl",
+    "docs/adm_page_chunks.jsonl",
+    "docs/adm_faq_chunks.jsonl"
+  ],
+  "count": 39
+}

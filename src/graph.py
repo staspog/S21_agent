@@ -39,6 +39,7 @@ from .pipeline.answer import generate_answer
 from .pipeline.decompose import decompose_question
 from .pipeline.expand_query import expand_query
 from .pipeline.fuse import rrf_fuse
+from .pipeline.rag_faiss import RagConfig, retrieve_rag_chunks
 from .pipeline.rerank import hybrid_rerank
 from .pipeline.search import search_rooms_x_queries
 from .pipeline.select_rooms import select_rooms
@@ -59,6 +60,9 @@ class AgentState(MessagesState):
     """
 
     subqueries: NotRequired[list[str]]
+    # Top-5 RAG chunks из FAISS (доменные справочные факты/ссылки).
+    # Заполняется последовательной нодой до декомпозиции.
+    rag_chunks: NotRequired[list[dict]]
     rooms_catalog: NotRequired[list[Room]]
     seed_rooms: NotRequired[list[Room]]
     evidence: Annotated[list[Evidence], operator.add]
@@ -84,9 +88,25 @@ def build_rc_graph(
 
     # ---------- nodes ----------
 
+    async def node_rag_context(state: AgentState) -> dict:
+        log.info("graph: rag_context start")
+        question = _last_human_text(list(state["messages"]))
+        loop = asyncio.get_running_loop()
+        rag_chunks = await loop.run_in_executor(
+            None,
+            lambda: retrieve_rag_chunks(
+                query=question,
+                cfg=RagConfig.from_env(),
+                reranker_model_name=rc_cfg.reranker_model,
+            ),
+        )
+        log.info("graph: rag_context end chunks=%s", len(rag_chunks))
+        return {"rag_chunks": rag_chunks}
+
     async def node_decompose(state: AgentState) -> dict:
         log.info("graph: decompose start")
         question = _last_human_text(list(state["messages"]))
+        rag_chunks = list(state.get("rag_chunks") or [])
         # decompose_question — sync LLM-вызов, выполним в default executor чтобы не блокировать loop
         loop = asyncio.get_running_loop()
         subs = await loop.run_in_executor(
@@ -95,6 +115,7 @@ def build_rc_graph(
                 llm=llm,
                 question=question,
                 max_subqueries=rc_cfg.max_subqueries,
+                rag_chunks=rag_chunks,
             ),
         )
         return {"subqueries": subs}
@@ -214,6 +235,7 @@ def build_rc_graph(
         raw_ev = list(state.get("evidence") or [])
         ev_list = _dedupe_across_subqueries(raw_ev)
         history = list(state["messages"])[:-1]
+        rag_chunks = list(state.get("rag_chunks") or [])
         loop = asyncio.get_running_loop()
         answer_text, sources = await loop.run_in_executor(
             None,
@@ -222,6 +244,7 @@ def build_rc_graph(
                 history=history,
                 user_question=question,
                 evidence_list=ev_list,
+                rag_chunks=rag_chunks,
             ),
         )
         return {
@@ -232,12 +255,14 @@ def build_rc_graph(
     # ---------- assembly ----------
 
     g: StateGraph = StateGraph(AgentState)
+    g.add_node("rag_context", node_rag_context)
     g.add_node("decompose", node_decompose)
     g.add_node("fetch_catalog", node_fetch_catalog)
     g.add_node("per_subquery", node_per_subquery)
     g.add_node("generate", node_generate)
 
-    g.add_edge(START, "decompose")
+    g.add_edge(START, "rag_context")
+    g.add_edge("rag_context", "decompose")
     g.add_edge("decompose", "fetch_catalog")
     g.add_conditional_edges("fetch_catalog", fanout, ["per_subquery"])
     g.add_edge("per_subquery", "generate")

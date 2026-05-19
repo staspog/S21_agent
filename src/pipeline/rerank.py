@@ -127,3 +127,36 @@ def hybrid_rerank(
         top[0].final_score if top else 0.0,
     )
     return top
+
+
+def rerank_texts(
+    *,
+    query: str,
+    texts: list[str],
+    model_name: str,
+    top_n: int = 5,
+) -> list[dict[str, float | int]]:
+    """Утилита: rerank произвольных текстов cross-encoder'ом.
+
+    Возвращает список dict-ов: {index: <позиция во входном texts>, score: <raw_score>},
+    отсортированный по score (desc). Использует тот же кэш/lock `_load_ce()`.
+    """
+    q = (query or "").strip()
+    if not q or not texts:
+        return []
+
+    n = max(1, int(top_n))
+    docs = [t or "" for t in texts]
+    try:
+        with _ce_lock:
+            model = _load_ce(model_name)
+        pairs = [(q, d) for d in docs]
+        ce_arr = model.predict(pairs, show_progress_bar=False, batch_size=16)
+        raw = [float(x) for x in np.asarray(ce_arr).tolist()]
+    except Exception:
+        log.exception("rerank_texts: cross-encoder failed")
+        return []
+
+    scored: list[tuple[float, int]] = [(raw[i], i) for i in range(len(raw))]
+    scored.sort(key=lambda t: t[0], reverse=True)
+    return [{"score": float(s), "index": int(i)} for s, i in scored[:n]]

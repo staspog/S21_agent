@@ -80,6 +80,9 @@ def expand_query(
     target: int = 3,
 ) -> list[str]:
     lemmas = lemmatize_keywords(subquery)
+    log.info(f"Lemmas: {lemmas}")
+    log.info(f"Subquery: {subquery}")
+    log.info(f"Target: {target}")
     prompt = (
         f"Подвопрос: {subquery}\n"
         f"Леммы-подсказки: {', '.join(lemmas) if lemmas else '—'}\n"

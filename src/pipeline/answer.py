@@ -10,8 +10,10 @@
     а грунд ответа на сообщения сохраняется машинно.
   • На случай если модель всё-таки вставила куда-то `[rc:...]`/`[rc=...]` —
     идёт страховочная очистка простым строковым сканированием (без regex).
-  • Если structured output упал — fallback на обычный `llm.invoke` с тем же
-    промптом; источники в этом случае берём из топ-3 hit-ов на подвопрос.
+  • Если structured output не распарсился — пробуем альтернативный json_mode.
+    Если и он не сработал, fallback идёт в отдельный plain markdown prompt
+    (без слов `FinalAnswer`/`cited_mids`), чтобы служебная схема не утекала
+    в пользовательский ответ.
 """
 
 from __future__ import annotations
@@ -22,6 +24,7 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, System
 from langchain_gigachat.chat_models import GigaChat
 
 from src.llm_gate import invoke_with_retry
+from src.pipeline.rag_faiss import rag_context_text
 from src.rc.schemas import Evidence, FinalAnswer, Hit
 
 log = logging.getLogger("s21.pipeline.answer")
@@ -31,7 +34,12 @@ _SYSTEM_PROMPT = (
     "Ты — помощник студентов Школы 21 (Сбер). Твоя задача — ответить пользователю,"
     " опираясь на сообщения из блока «EVIDENCE» (сгруппированы по подвопросам).\n\n"
     "Правила содержания:\n"
-    "  1. Используй ТОЛЬКО факты из EVIDENCE. Не добавляй сведений от себя.\n"
+    "  1. ФАКТЫ в ответе бери в первую очередь из EVIDENCE.\n"
+    "  2. Также тебе может быть дан блок RAG_CONTEXT — это справка по теме вопроса "
+    "(доменные термины/процессы/ссылки Школы 21). Используй его как фон для более "
+    "точной интерпретации вопроса и формулировок. Не противопоставляй RAG_CONTEXT "
+    "EVIDENCE.\n"
+    "  3. Если RAG_CONTEXT противоречит EVIDENCE — прямо скажи, что данные расходятся.\n"
     "  2. Если для подвопроса нет релевантных сообщений — скажи «в доступных "
     "сообщениях нет данных», не выдумывай.\n"
     "  3. Тон — деловой, краткий, по-русски, в формате Markdown.\n"
@@ -53,6 +61,30 @@ _SYSTEM_PROMPT = (
     "  ХОРОШО: «Карьерный день пройдёт 28 апреля.» + cited_mids=[\"NCdLgfeu5FgnCizvs\"]\n\n"
     "  ПЛОХО: «- Описание: ...\\n  - Источник: mid=cQTAEJBeY8phF366r»\n"
     "  ХОРОШО: «- Описание: ...» + cited_mids=[\"cQTAEJBeY8phF366r\"]"
+)
+
+
+_PLAIN_SYSTEM_PROMPT = (
+    "Ты — помощник студентов Школы 21 (Сбер). Твоя задача — ответить пользователю,"
+    " опираясь на сообщения из блока «EVIDENCE» (сгруппированы по подвопросам).\n\n"
+    "Правила:\n"
+    "  1. ФАКТЫ в ответе бери в первую очередь из EVIDENCE.\n"
+    "  2. Также тебе может быть дан блок RAG_CONTEXT — справка по теме вопроса. "
+    "Используй его как фон/контекст, но не спорь с EVIDENCE.\n"
+    "  3. Если RAG_CONTEXT противоречит EVIDENCE — прямо скажи, что данные расходятся.\n"
+    "  2. Если для подвопроса нет релевантных сообщений — скажи «в доступных "
+    "сообщениях нет данных», не выдумывай.\n"
+    "  3. Тон — деловой, краткий, по-русски, в формате Markdown.\n"
+    "  4. Не добавляй блок «Источники» / «Ссылки» — сервер сделает это сам.\n"
+    "  5. Не вставляй технические идентификаторы Rocket.Chat, mid, msg, permalink "
+    "или метки вида [rc:...], [mid:...].\n"
+    "  6. Не упоминай названия внутренних схем, полей или форматов вывода."
+)
+
+
+_JSON_MODE_NOTE = (
+    "\n\nДля json_mode: верни СТРОГО один JSON-объект без markdown-обёртки, "
+    "без пояснений до/после JSON. Ключи: answer_markdown, cited_mids."
 )
 
 
@@ -184,6 +216,109 @@ def _build_sources_section(sources: list[str]) -> str:
     return "\n".join(lines)
 
 
+def _build_answer_convo(
+    *,
+    system_prompt: str,
+    history: list[BaseMessage],
+    user_question: str,
+    evidence_text: str,
+    rag_text: str,
+    tail_instruction: str,
+) -> list[BaseMessage]:
+    convo: list[BaseMessage] = [SystemMessage(content=system_prompt)] + list(history)
+    convo.append(
+        HumanMessage(
+            content=(
+                f"Вопрос: {user_question}\n\n"
+                + (f"RAG_CONTEXT (справка по теме; используй как фон):\n{rag_text}\n\n" if rag_text else "")
+                + f"EVIDENCE (фактическая база):\n{evidence_text}\n\n"
+                + f"{tail_instruction}"
+            )
+        )
+    )
+    return convo
+
+
+def _parsed_final_answer(payload) -> FinalAnswer | None:
+    """Нормализует результат `with_structured_output(..., include_raw=True)`.
+
+    По актуальной документации LangChain/GigaChat `include_raw=True` возвращает
+    dict с ключами `raw`, `parsed`, `parsing_error`. Это важно: parsing_error
+    перестаёт быть исключением, и мы можем логировать причину, не скатываясь
+    сразу в plain fallback.
+    """
+    if isinstance(payload, FinalAnswer):
+        return payload
+    if isinstance(payload, dict):
+        parsed = payload.get("parsed")
+        if isinstance(parsed, FinalAnswer):
+            return parsed
+        err = payload.get("parsing_error")
+        raw = payload.get("raw")
+        raw_content = getattr(raw, "content", "")
+        log.warning(
+            "answer: structured parsed=None parsing_error=%r raw_chars=%s",
+            err,
+            len(raw_content) if isinstance(raw_content, str) else 0,
+        )
+    return None
+
+
+def _invoke_structured_answer(
+    *,
+    llm: GigaChat,
+    history: list[BaseMessage],
+    user_question: str,
+    evidence_text: str,
+    rag_text: str,
+) -> tuple[FinalAnswer | None, str]:
+    """Пробует structured output двумя официальными режимами GigaChat.
+
+    1. `function_calling` — строгий tool/function-call контракт.
+    2. `json_mode` — резервный режим: модель генерирует JSON, LangChain парсит
+       его через Pydantic.
+
+    Возвращает `(answer, method_name)`, где `answer=None`, если оба режима не
+    дали валидный `FinalAnswer`.
+    """
+    attempts: tuple[tuple[str, str], ...] = (
+        (
+            "function_calling",
+            "Ответь через схему FinalAnswer. Не печатай схему текстом.",
+        ),
+        (
+            "json_mode",
+            "Ответь через схему FinalAnswer." + _JSON_MODE_NOTE,
+        ),
+    )
+    for method, instruction in attempts:
+        convo = _build_answer_convo(
+            system_prompt=_SYSTEM_PROMPT + (_JSON_MODE_NOTE if method == "json_mode" else ""),
+            history=history,
+            user_question=user_question,
+            evidence_text=evidence_text,
+            rag_text=rag_text,
+            tail_instruction=instruction,
+        )
+        try:
+            structured_llm = llm.with_structured_output(
+                FinalAnswer,
+                method=method,
+                include_raw=True,
+            )
+            payload = invoke_with_retry(
+                structured_llm.invoke,
+                convo,
+                label=f"answer.structured.{method}",
+            )
+            parsed = _parsed_final_answer(payload)
+            if parsed is not None:
+                return parsed, method
+        except Exception:
+            log.exception("answer: structured %s failed", method)
+    return None, ""
+
+
 _TECH_KV_LABELS = (
     "источник",
     "источники",
@@ -280,6 +415,36 @@ def _strip_known_mid_lines(text: str, known_mids) -> str:
     return "\n".join(collapsed)
 
 
+def _strip_empty_inline_tech_suffixes(text: str) -> str:
+    """Удаляет inline-хвосты вида `... Источник: mid=` после удаления mid.
+
+    `_strip_known_mid_lines()` удаляет целые строки, если строка полностью
+    превратилась в технический label. Этот helper покрывает другой системный
+    случай: содержательная строка + пустой технический suffix в конце.
+    """
+    if not text:
+        return text or ""
+
+    out: list[str] = []
+    for line in text.split("\n"):
+        current = line
+        lowered = current.lower()
+        cut_at: int | None = None
+        for label in _TECH_KV_LABELS:
+            for sep in (":", "="):
+                needle = label + sep
+                idx = lowered.find(needle)
+                if idx < 0:
+                    continue
+                suffix = current[idx:]
+                if _line_is_empty_after_label(suffix):
+                    cut_at = idx if cut_at is None else min(cut_at, idx)
+        if cut_at is not None:
+            current = current[:cut_at].rstrip(" \t,;:-—–")
+        out.append(current)
+    return "\n".join(out)
+
+
 def _strip_existing_sources_block(text: str) -> str:
     """Если модель всё равно вписала блок 'Источники' — отрежем его, чтобы
     не задвоить с серверным.
@@ -292,6 +457,50 @@ def _strip_existing_sources_block(text: str) -> str:
         if idx >= 0:
             return text[:idx].rstrip()
     return text
+
+
+def _strip_structured_envelope(text: str) -> str:
+    """Страховка от утечки служебной структуры в обычный текст.
+
+    Это не основной путь. Основной путь — `parsed: FinalAnswer` из
+    `with_structured_output`. Но если plain fallback всё же вернул оболочку
+    вида `FinalAnswer: ... answer_markdown: ... cited_mids: ...`, снимаем её
+    построчно, без регулярных выражений:
+      • первая строка с названием модели выбрасывается;
+      • строка-лейбл `answer_markdown` выбрасывается;
+      • blockquote-префикс `>` снимается, если он появился как часть
+        сериализации structured-поля;
+      • всё начиная с `cited_mids` выбрасывается, потому что источники сервер
+        всё равно строит сам.
+    """
+    if not text:
+        return text or ""
+
+    lines = text.split("\n")
+    out: list[str] = []
+    envelope_seen = False
+
+    for line in lines:
+        normalized = line.strip().strip("*_` ").lower()
+        if not envelope_seen and normalized.startswith("finalanswer"):
+            envelope_seen = True
+            continue
+        if normalized.startswith("answer_markdown"):
+            envelope_seen = True
+            continue
+        if normalized.startswith("cited_mids"):
+            envelope_seen = True
+            break
+        if envelope_seen:
+            stripped = line.lstrip()
+            if stripped.startswith(">"):
+                stripped = stripped[1:].lstrip()
+                out.append(stripped)
+                continue
+        out.append(line)
+
+    cleaned = "\n".join(out).strip()
+    return cleaned or text
 
 
 def _resolve_sources(
@@ -331,6 +540,7 @@ def generate_answer(
     history: list[BaseMessage],
     user_question: str,
     evidence_list: list[Evidence],
+    rag_chunks: list[dict] | None = None,
 ) -> tuple[str, list[str]]:
     """Возвращает `(markdown, sources)` с серверно-сформированным блоком «Источники».
 
@@ -339,50 +549,63 @@ def generate_answer(
     output формате `FinalAnswer`, чтобы пользователю не утекали технические mid.
     """
     evidence_text, by_mid = _format_evidence(evidence_list)
-    system = SystemMessage(content=_SYSTEM_PROMPT)
-    convo: list[BaseMessage] = [system] + list(history)
-    convo.append(
-        HumanMessage(
-            content=(
-                f"Вопрос: {user_question}\n\n"
-                f"EVIDENCE (фактическая база):\n{evidence_text}\n\n"
-                "Ответь по правилам выше через схему FinalAnswer."
-            )
-        )
-    )
+    rag_text = rag_context_text(rag_chunks)
 
     log.info(
-        "answer: history=%s evidence_groups=%s evidence_msgs=%s",
+        "answer: history=%s evidence_groups=%s evidence_msgs=%s rag_chunks=%s",
         len(history),
         len(evidence_list),
         len(by_mid),
+        len(rag_chunks or []),
     )
 
     answer_md = ""
     cited_mids: list[str] = []
     structured_ok = False
-    try:
-        structured_llm = llm.with_structured_output(FinalAnswer)
-        result: FinalAnswer = invoke_with_retry(
-            structured_llm.invoke, convo, label="answer.structured"
-        )
+    structured_method = ""
+
+    result, structured_method = _invoke_structured_answer(
+        llm=llm,
+        history=history,
+        user_question=user_question,
+        evidence_text=evidence_text,
+        rag_text=rag_text,
+    )
+    if result is not None:
         answer_md = (result.answer_markdown or "").strip()
         # фильтрация: только mid, реально присутствующие в EVIDENCE
         cited_mids = [m for m in (result.cited_mids or []) if m in by_mid]
         structured_ok = True
-    except Exception:
-        log.exception("answer: structured output failed, fallback to plain invoke")
+    else:
+        log.warning("answer: all structured modes failed, fallback to plain markdown")
         try:
-            response = invoke_with_retry(llm.invoke, convo, label="answer.plain")
+            plain_convo = _build_answer_convo(
+                system_prompt=_PLAIN_SYSTEM_PROMPT,
+                history=history,
+                user_question=user_question,
+                evidence_text=evidence_text,
+                rag_text=rag_text,
+                tail_instruction=(
+                    "Ответь обычным Markdown для пользователя. "
+                    "Не используй служебные названия схем/полей и не добавляй блок источников."
+                ),
+            )
+            response = invoke_with_retry(llm.invoke, plain_convo, label="answer.plain")
             raw = getattr(response, "content", "") or ""
             answer_md = raw if isinstance(raw, str) else str(raw)
             answer_md = answer_md.strip()
         except Exception:
-            log.exception("answer: plain invoke also failed")
+            log.exception("answer: plain invoke failed")
             answer_md = (
                 "Не удалось сгенерировать ответ из-за ошибки модели. "
                 "Попробуйте переформулировать вопрос."
             )
+
+    if answer_md.startswith(("FinalAnswer:", "FinalAnswer\n")):
+        log.warning(
+            "answer: plain text contains structured envelope, applying cleanup"
+        )
+        answer_md = _strip_structured_envelope(answer_md)
 
     # Страховочная очистка (без regex, идемпотентна и системна):
     #   1) выкашиваем скобочные метки вида [rc:...]/[rc=...]/[mid:...]/[ref:...];
@@ -393,6 +616,7 @@ def generate_answer(
     #      (сервер пришьёт корректный).
     cleaned = _strip_citation_brackets(answer_md)
     cleaned = _strip_known_mid_lines(cleaned, by_mid.keys())
+    cleaned = _strip_empty_inline_tech_suffixes(cleaned)
     cleaned = _strip_existing_sources_block(cleaned).rstrip()
 
     # Если structured output не сработал — попробуем восстановить cited_mids
@@ -409,8 +633,9 @@ def generate_answer(
     final_md = cleaned + _build_sources_section(sources)
 
     log.info(
-        "answer: structured=%s chars=%s sources=%s cited=%s",
+        "answer: structured=%s method=%s chars=%s sources=%s cited=%s",
         structured_ok,
+        structured_method or "none",
         len(final_md),
         len(sources),
         len(cited_mids),
