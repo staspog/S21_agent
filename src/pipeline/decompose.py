@@ -11,25 +11,34 @@ import logging
 from langchain_gigachat.chat_models import GigaChat
 
 from src.llm_gate import invoke_with_retry
-from src.rc.schemas import SubqueryPlan
 from src.pipeline.rag_faiss import rag_context_text
+from src.prompts import build_decompose_prompt
+from src.rc.schemas import SubqueryPlan
 
 log = logging.getLogger("s21.pipeline.decompose")
 
 
-_SYSTEM_PROMPT = (
-    "Ты — планировщик информационного поиска для чат-бота Школы 21 (Сбер).\n"
-    "Получив вопрос пользователя, разложи его на 1–5 независимых ПОДВОПРОСОВ.\n"
-    "Каждый подвопрос:\n"
-    "  • короткий (1 предложение), на русском языке;\n"
-    "  • описывает один информационный intent (одно событие/факт/ссылку/дату);\n"
-    "  • не дублирует другие подвопросы;\n"
-    "  • сохраняет смысл оригинала (без додумывания).\n"
-    "Если запрос простой и про одну вещь — верни один элемент.\n"
-    "Если запрос сложный (\"что было ... и что будет ... и где найти ...\") — раздели "
-    "его на смысловые части.\n"
-    "ОТВЕЧАЙ только согласно схеме SubqueryPlan."
+_COMPOUND_MARKERS = (
+    " и ",
+    " а также ",
+    "?,",
+    ";",
+    "? и ",
+    "? а ",
 )
+
+
+def _is_simple_question(question: str) -> bool:
+    """Один intent — skip LLM decompose."""
+    q = (question or "").strip()
+    if not q or len(q) > 120:
+        return False
+    lower = q.lower()
+    if any(m in lower for m in _COMPOUND_MARKERS):
+        return False
+    if q.count("?") > 1:
+        return False
+    return True
 
 
 def decompose_question(
@@ -44,6 +53,10 @@ def decompose_question(
     if not q:
         return []
 
+    if _is_simple_question(q):
+        log.info("decompose: simple question fast-path → 1 subquery")
+        return [q]
+
     rag_text = rag_context_text(rag_chunks)
 
     structured = llm.with_structured_output(SubqueryPlan)
@@ -51,7 +64,7 @@ def decompose_question(
         result: SubqueryPlan = invoke_with_retry(
             structured.invoke,
             [
-                ("system", _SYSTEM_PROMPT),
+                ("system", build_decompose_prompt()),
                 (
                     "human",
                     (

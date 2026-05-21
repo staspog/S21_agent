@@ -8,9 +8,15 @@ import os
 import time
 import uuid
 from contextlib import asynccontextmanager
-from pathlib import Path
 
 from dotenv import load_dotenv
+
+load_dotenv()
+
+from .pipeline.rerank import apply_cpu_threads
+
+apply_cpu_threads()
+
 from fastapi import FastAPI, HTTPException, Request
 from langchain_core.messages import HumanMessage
 from langchain_gigachat.chat_models import GigaChat
@@ -18,8 +24,9 @@ from pydantic import BaseModel, Field
 
 from .graph import build_rc_graph
 from .llm_gate import get_default_gate
-from .pipeline.rag_faiss import RagConfig, load_rag_assets
+from .pipeline.rag_faiss import RagConfig, load_rag_assets, rag_status
 from .pipeline.rerank import warmup_reranker
+from .rc.availability import RocketChatAvailability
 from .rc.catalog import RoomCatalog
 from .rc.client import RocketChatClient
 from .rc.config import load_rc_config
@@ -40,8 +47,6 @@ def _setup_logging() -> None:
 _setup_logging()
 log = logging.getLogger("s21.api")
 
-load_dotenv()
-
 api_key = os.getenv("GIGACHAT_API_KEY")
 if not api_key:
     raise RuntimeError("GIGACHAT_API_KEY не найден в .env")
@@ -49,6 +54,10 @@ if not api_key:
 rc_cfg = load_rc_config()
 rc_client = RocketChatClient(rc_cfg)
 rc_catalog = RoomCatalog(rc_client, rc_cfg)
+rc_availability = RocketChatAvailability(
+    probe_timeout_s=rc_cfg.probe_timeout_s,
+    cache_ttl_s=rc_cfg.probe_cache_ttl_s,
+)
 llm = GigaChat(
     credentials=api_key,
     verify_ssl_certs=False,
@@ -57,16 +66,17 @@ llm = GigaChat(
     timeout=600,
 )
 try:
-    logging.info(f"available LLM models: {llm.get_models()}")
+    logging.info("GigaChat client initialized (models list on first /ask)")
 except Exception as e:
     logging.error(f"Error: {e}")
     raise e
-get_default_gate()  # инициализация singleton до первой LLM-нагрузки
+get_default_gate()
 graph = build_rc_graph(
     llm=llm,
     rc_client=rc_client,
     rc_catalog=rc_catalog,
     rc_cfg=rc_cfg,
+    rc_availability=rc_availability,
 )
 log.info("Граф собран. Reranker=%s", rc_cfg.reranker_model)
 
@@ -79,13 +89,26 @@ if ASK_TIMEOUT_S <= 0:
     ASK_TIMEOUT_S = 300.0
 log.info("ASK_TIMEOUT_S=%s (504 если граф дольше)", ASK_TIMEOUT_S)
 
+_ask_semaphore = asyncio.Semaphore(1)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Прогрев каталога и реранкера в фоне (не блокируем старт).
     async def _bg():
         try:
-            await rc_catalog.get()
+            ok, err = await rc_availability.check(rc_client)
+            if ok:
+                await asyncio.wait_for(
+                    rc_catalog.get(),
+                    timeout=rc_cfg.catalog_fetch_timeout_s,
+                )
+            else:
+                log.warning("startup: RC unavailable (%s), skip catalog preload", err)
+        except asyncio.TimeoutError:
+            rc_availability.mark_unavailable(
+                f"catalog timeout ({rc_cfg.catalog_fetch_timeout_s:.0f}s)"
+            )
+            log.warning("startup: каталог комнат не успел загрузиться")
         except Exception:
             log.exception("startup: каталог комнат не подгрузился, попробуем позже")
         try:
@@ -133,7 +156,8 @@ class QueryRequest(BaseModel):
     question: str = Field(min_length=1)
     session_id: str | None = None
     include_sources: bool = True
-    # Сохраняем старое имя поля для совместимости с test_client.py — игнорируется.
+    deep_search: bool = False
+    rocket_search: bool = False
     top_k: int | None = Field(default=None, exclude=True)
 
 
@@ -146,21 +170,32 @@ class QueryResponse(BaseModel):
 @app.post("/ask", response_model=QueryResponse)
 async def ask_question(request: QueryRequest):
     session_id = request.session_id or str(uuid.uuid4())
+    deep = request.deep_search
+    rocket = request.rocket_search
+    if deep and not rocket:
+        deep = False
     log.info(
-        "ask start session_id=%s question_len=%s include_sources=%s",
+        "ask start session_id=%s question_len=%s deep=%s rocket=%s include_sources=%s",
         session_id,
         len(request.question),
+        deep,
+        rocket,
         request.include_sources,
     )
     t0 = time.perf_counter()
     try:
-        result = await asyncio.wait_for(
-            graph.ainvoke(
-                {"messages": [HumanMessage(content=request.question)]},
-                {"configurable": {"thread_id": session_id}},
-            ),
-            timeout=ASK_TIMEOUT_S,
-        )
+        async with _ask_semaphore:
+            result = await asyncio.wait_for(
+                graph.ainvoke(
+                    {
+                        "messages": [HumanMessage(content=request.question)],
+                        "deep_search": deep,
+                        "rocket_search": rocket,
+                    },
+                    {"configurable": {"thread_id": session_id}},
+                ),
+                timeout=ASK_TIMEOUT_S,
+            )
         elapsed = time.perf_counter() - t0
         messages = result["messages"]
         last = messages[-1]
@@ -179,8 +214,10 @@ async def ask_question(request: QueryRequest):
                     sources.append(s)
 
         log.info(
-            "ask done session_id=%s graph_s=%.3f answer_len=%s sources=%s",
+            "ask done session_id=%s deep=%s rocket=%s graph_s=%.3f answer_len=%s sources=%s",
             session_id,
+            deep,
+            rocket,
             elapsed,
             len(answer),
             len(sources or []),
@@ -205,4 +242,12 @@ async def ask_question(request: QueryRequest):
 
 @app.get("/health")
 async def health() -> dict:
-    return {"status": "ok"}
+    rc_ok, rc_err = await rc_availability.check(rc_client)
+    status: dict = {
+        "status": "ok",
+        "rocket_chat_available": rc_ok,
+    }
+    if rc_err:
+        status["rocket_chat_error"] = rc_err
+    status.update(rag_status())
+    return status

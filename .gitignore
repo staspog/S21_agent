@@ -153,6 +153,8 @@ activemq-data/
 .venv
 env/
 venv/
+.build_venv
+.rag_build_venv
 ENV/
 env.bak/
 venv.bak/
@@ -215,4 +217,11 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
-logs/
+# Private agent data (see secrets/materials/agent/ and README.md)
+faiss_store/
+corpus/
+adm_info/
+src/prompts/system.py
+docs/*_chunks.jsonl
+docs.ipynb
+.corpus_hash

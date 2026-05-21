@@ -29,11 +29,12 @@ def select_rooms(
     Сигнатура сохранена для совместимости с графом, но `llm/subquery/target`
     не влияют на выбор комнат.
     """
+    cap = max(1, int(target))
     if seed_rooms:
-        log.info("select_rooms: fixed top-rooms mode → %s rooms", len(seed_rooms))
-        return list(seed_rooms)
+        chosen = list(seed_rooms[:cap])
+        log.info("select_rooms: fixed top-rooms mode → %s rooms (cap=%s)", len(chosen), cap)
+        return chosen
 
-    # Fallback: если каталог ещё не прогрет / seed_rooms пуст — берём первые 25 комнат каталога.
-    chosen = list(catalog[:25]) if catalog else []
+    chosen = list(catalog[:cap]) if catalog else []
     log.info("select_rooms: fixed mode fallback to catalog → %s rooms", len(chosen))
     return chosen

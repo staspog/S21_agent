@@ -27,8 +27,8 @@ class RagConfig:
     chunks_path: Path = Path("faiss_store/chunks.jsonl")
     config_path: Path = Path("faiss_store/config.json")
     embed_model: str = "intfloat/multilingual-e5-small"
-    top_k: int = 10
-    rerank_top_n: int = 5
+    top_k: int = 5
+    rerank_top_n: int = 0
 
     @staticmethod
     def from_env() -> "RagConfig":
@@ -46,8 +46,8 @@ class RagConfig:
             chunks_path=Path(os.getenv("RAG_CHUNKS_PATH", "faiss_store/chunks.jsonl")),
             config_path=Path(os.getenv("RAG_CONFIG_PATH", "faiss_store/config.json")),
             embed_model=os.getenv("RAG_EMBED_MODEL", "intfloat/multilingual-e5-small"),
-            top_k=_env_int("RAG_TOPK", 10),
-            rerank_top_n=_env_int("RAG_RERANK_TOP", 5),
+            top_k=_env_int("RAG_TOPK", 5),
+            rerank_top_n=_env_int("RAG_RERANK_TOP", 0),
         )
 
 
@@ -74,10 +74,9 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
 
 
 def _safe_env_for_cpu() -> None:
-    # На macOS/CPU иногда встречаются падения/зависания из-за параллелизма tokenizers/BLAS.
-    os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
-    os.environ.setdefault("OMP_NUM_THREADS", "1")
-    os.environ.setdefault("MKL_NUM_THREADS", "1")
+    from src.pipeline.rerank import apply_cpu_threads
+
+    apply_cpu_threads()
 
 
 def load_rag_assets(cfg: RagConfig) -> None:
@@ -89,10 +88,7 @@ def load_rag_assets(cfg: RagConfig) -> None:
         _safe_env_for_cpu()
 
         import faiss  # локальный импорт, чтобы не грузить faiss при старте без RAG
-        import torch
         from sentence_transformers import SentenceTransformer
-
-        torch.set_num_threads(1)
 
         store_cfg = _read_json(cfg.config_path)
         model_name = (store_cfg.get("model") or cfg.embed_model).strip() or cfg.embed_model
@@ -134,7 +130,10 @@ def _embed_query(text: str) -> np.ndarray:
 def _format_chunk_for_prompt(ch: dict[str, Any], *, max_chars: int = 900) -> str:
     meta = ch.get("metadata") or {}
     section = (meta.get("section") or "").strip()
-    source = (meta.get("source") or meta.get("chunk_file") or "").strip()
+    source = (
+        (meta.get("url") or meta.get("source") or meta.get("slug") or "")
+        .strip()
+    )
     txt = (ch.get("text") or "").strip()
     if len(txt) > max_chars:
         txt = txt[: max_chars - 1] + "…"
@@ -176,6 +175,10 @@ def retrieve_rag_chunks(
     if not candidates:
         return []
 
+    rerank_n = int(cfg.rerank_top_n)
+    if rerank_n <= 0:
+        return candidates[: max(1, int(cfg.top_k))]
+
     texts = [c.get("text") or "" for c in candidates]
     reranked = rerank_texts(
         query=query,
@@ -198,6 +201,24 @@ def retrieve_rag_chunks(
     return out
 
 
+def rag_status(cfg: RagConfig | None = None) -> dict[str, Any]:
+    """Diagnostics for /health: whether FAISS index is loaded."""
+    cfg = cfg or RagConfig.from_env()
+    loaded = bool(_cached.get("loaded"))
+    chunks = _cached.get("chunks") if loaded else None
+    ntotal = None
+    if loaded:
+        index = _cached.get("index")
+        ntotal = getattr(index, "ntotal", None)
+    index_exists = cfg.index_path.is_file()
+    return {
+        "rag_loaded": loaded,
+        "rag_chunks": len(chunks) if chunks is not None else (None if not index_exists else 0),
+        "rag_index_ntotal": ntotal,
+        "rag_index_path_exists": index_exists,
+    }
+
+
 def rag_context_text(chunks: list[dict[str, Any]] | None) -> str:
     """Строка для промптов: короткий справочный контекст из top чанков."""
     items = list(chunks or [])
@@ -212,5 +233,6 @@ __all__ = [
     "load_rag_assets",
     "retrieve_rag_chunks",
     "rag_context_text",
+    "rag_status",
 ]
 

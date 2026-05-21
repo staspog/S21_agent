@@ -45,6 +45,10 @@ class RocketChatClient:
         )
         self._sem = asyncio.Semaphore(cfg.http_concurrency)
 
+    @property
+    def search_timeout_s(self) -> float:
+        return self._cfg.search_timeout_s
+
     async def aclose(self) -> None:
         await self._client.aclose()
 
@@ -53,6 +57,10 @@ class RocketChatClient:
 
     async def __aexit__(self, *args: Any) -> None:
         await self.aclose()
+
+    async def probe_login(self) -> None:
+        """Лёгкая проверка доступности: login без загрузки каталога."""
+        await self._login()
 
     async def _login(self) -> tuple[str, str]:
         """Логинимся; результат кэшируется до 401 от сервера."""
@@ -81,8 +89,18 @@ class RocketChatClient:
         path: str,
         *,
         params: dict[str, Any] | None = None,
+        read_timeout_s: float | None = None,
     ) -> dict[str, Any]:
         """Запрос с авто-rerelogin на 401 и обработкой 429 (до 2 ретраев)."""
+        cfg = self._cfg
+        req_timeout: httpx.Timeout | None = None
+        if read_timeout_s is not None:
+            req_timeout = httpx.Timeout(
+                connect=cfg.timeout_connect_s,
+                read=read_timeout_s,
+                write=read_timeout_s,
+                pool=cfg.timeout_connect_s,
+            )
         attempts = 0
         last_exc: Exception | None = None
         while attempts < 3:
@@ -91,7 +109,11 @@ class RocketChatClient:
                 async with self._sem:
                     headers = await self._auth_headers()
                     r = await self._client.request(
-                        method, path, headers=headers, params=params
+                        method,
+                        path,
+                        headers=headers,
+                        params=params,
+                        timeout=req_timeout,
                     )
                 if r.status_code == 401:
                     async with self._auth_lock:
@@ -210,7 +232,16 @@ class RocketChatClient:
                     "count": c,
                     "offset": 0,
                 },
+                read_timeout_s=self._cfg.search_timeout_s,
             )
+        except httpx.TimeoutException:
+            log.warning(
+                "RC chat.search timeout room=%s q=%r limit_s=%s",
+                room.name,
+                search_text,
+                self._cfg.search_timeout_s,
+            )
+            return []
         except Exception:
             log.exception(
                 "RC chat.search failed room=%s q=%r", room.name, search_text
@@ -264,7 +295,15 @@ class RocketChatClient:
                 "GET",
                 "/api/v1/chat.getThreadMessages",
                 params={"tmid": tmid, "count": c, "offset": 0},
+                read_timeout_s=self._cfg.thread_timeout_s,
             )
+        except httpx.TimeoutException:
+            log.warning(
+                "RC getThreadMessages timeout tmid=%s limit_s=%s",
+                tmid,
+                self._cfg.thread_timeout_s,
+            )
+            return []
         except Exception:
             log.exception("RC getThreadMessages failed tmid=%s", tmid)
             return []

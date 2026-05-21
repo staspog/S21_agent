@@ -1,6 +1,8 @@
 # Исключаем виртуальное окружение
 venv
 .venv
+.build_venv
+.rag_build_venv
 
 # Исключаем кэш Python
 __pycache__

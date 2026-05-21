@@ -19,97 +19,91 @@
 from __future__ import annotations
 
 import logging
+import os
+import re
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 from langchain_gigachat.chat_models import GigaChat
 
+from src.campus_intent import is_operational_campus_question
 from src.llm_gate import invoke_with_retry
 from src.pipeline.rag_faiss import rag_context_text
+from src.prompts import (
+    ANSWER_PLAIN_TAIL,
+    ANSWER_STRUCTURED_TAIL,
+    JSON_MODE_NOTE,
+    build_answer_plain_prompt,
+    build_answer_system_prompt,
+)
 from src.rc.schemas import Evidence, FinalAnswer, Hit
 
 log = logging.getLogger("s21.pipeline.answer")
 
 
-_SYSTEM_PROMPT = (
-    "Ты — помощник студентов Школы 21 (Сбер). Твоя задача — ответить пользователю,"
-    " опираясь на сообщения из блока «EVIDENCE» (сгруппированы по подвопросам).\n\n"
-    "Правила содержания:\n"
-    "  1. ФАКТЫ в ответе бери в первую очередь из EVIDENCE.\n"
-    "  2. Также тебе может быть дан блок RAG_CONTEXT — это справка по теме вопроса "
-    "(доменные термины/процессы/ссылки Школы 21). Используй его как фон для более "
-    "точной интерпретации вопроса и формулировок. Не противопоставляй RAG_CONTEXT "
-    "EVIDENCE.\n"
-    "  3. Если RAG_CONTEXT противоречит EVIDENCE — прямо скажи, что данные расходятся.\n"
-    "  2. Если для подвопроса нет релевантных сообщений — скажи «в доступных "
-    "сообщениях нет данных», не выдумывай.\n"
-    "  3. Тон — деловой, краткий, по-русски, в формате Markdown.\n"
-    "  4. Если несколько сообщений противоречат — приведи разные точки зрения, "
-    "не пытаясь выбирать «правильное».\n\n"
-    "Правила формы (КРИТИЧНО):\n"
-    "  • Возвращай результат строго по схеме `FinalAnswer`.\n"
-    "  • В `answer_markdown` пиши чистый markdown как для конечного пользователя:\n"
-    "      — без идентификаторов сообщений Rocket.Chat в любой форме;\n"
-    "      — без меток [rc:<mid>], [rc=<mid>], [mid:...], [ref:...];\n"
-    "      — без полей вида «Источник: ...», «mid=...», «permalink=...», «msg=...»,\n"
-    "        «Ссылка: ...» — служебные ссылки добавит сервер отдельным блоком.\n"
-    "      — без блока «Источники» / «Ссылки» / «Permalink» — его допишет сервер.\n"
-    "  • В `cited_mids` перечисли mid сообщений из EVIDENCE, на которые реально\n"
-    "    опирается ответ. mid — это значение поля `mid=` в EVIDENCE. Без mid,\n"
-    "    которых нет в EVIDENCE.\n\n"
-    "Примеры (ПЛОХО → ХОРОШО):\n"
-    "  ПЛОХО: «Карьерный день пройдёт 28 апреля [rc:NCdLgfeu5FgnCizvs].»\n"
-    "  ХОРОШО: «Карьерный день пройдёт 28 апреля.» + cited_mids=[\"NCdLgfeu5FgnCizvs\"]\n\n"
-    "  ПЛОХО: «- Описание: ...\\n  - Источник: mid=cQTAEJBeY8phF366r»\n"
-    "  ХОРОШО: «- Описание: ...» + cited_mids=[\"cQTAEJBeY8phF366r\"]"
-)
+def _evidence_msg_max_chars() -> int:
+    raw = os.getenv("RC_EVIDENCE_MSG_MAX_CHARS", "2500").strip()
+    try:
+        n = int(raw)
+    except ValueError:
+        n = 2500
+    return max(0, n)
 
 
-_PLAIN_SYSTEM_PROMPT = (
-    "Ты — помощник студентов Школы 21 (Сбер). Твоя задача — ответить пользователю,"
-    " опираясь на сообщения из блока «EVIDENCE» (сгруппированы по подвопросам).\n\n"
-    "Правила:\n"
-    "  1. ФАКТЫ в ответе бери в первую очередь из EVIDENCE.\n"
-    "  2. Также тебе может быть дан блок RAG_CONTEXT — справка по теме вопроса. "
-    "Используй его как фон/контекст, но не спорь с EVIDENCE.\n"
-    "  3. Если RAG_CONTEXT противоречит EVIDENCE — прямо скажи, что данные расходятся.\n"
-    "  2. Если для подвопроса нет релевантных сообщений — скажи «в доступных "
-    "сообщениях нет данных», не выдумывай.\n"
-    "  3. Тон — деловой, краткий, по-русски, в формате Markdown.\n"
-    "  4. Не добавляй блок «Источники» / «Ссылки» — сервер сделает это сам.\n"
-    "  5. Не вставляй технические идентификаторы Rocket.Chat, mid, msg, permalink "
-    "или метки вида [rc:...], [mid:...].\n"
-    "  6. Не упоминай названия внутренних схем, полей или форматов вывода."
-)
+def _clip_msg(text: str, max_chars: int) -> str:
+    txt = (text or "").strip()
+    if max_chars <= 0 or len(txt) <= max_chars:
+        return txt
+    return txt[: max_chars - 1] + "…"
 
 
-_JSON_MODE_NOTE = (
-    "\n\nДля json_mode: верни СТРОГО один JSON-объект без markdown-обёртки, "
-    "без пояснений до/после JSON. Ключи: answer_markdown, cited_mids."
-)
+def _format_hit_block(h: Hit, *, max_chars: int, indent: str = "") -> list[str]:
+    txt = _clip_msg(h.msg or "", max_chars)
+    flags: list[str] = []
+    if h.is_thread_reply:
+        flags.append("reply")
+    if h.thread_root_mid and h.thread_root_mid != h.mid:
+        flags.append(f"thread_root={h.thread_root_mid}")
+    flag_s = f" ({', '.join(flags)})" if flags else ""
+    return [
+        f"{indent}- mid={h.mid}{flag_s} | room={h.room_kind}/{h.room_name} | "
+        f"@{h.user or '—'} | {h.ts or '—'}",
+        f"{indent}  permalink: {h.permalink}",
+        f"{indent}  text:",
+        f"{indent}  ```",
+        *([f"{indent}  {line}" for line in txt.splitlines()] or [f"{indent}  "]),
+        f"{indent}  ```",
+    ]
 
 
 def _format_evidence(evidence_list: list[Evidence]) -> tuple[str, dict[str, Hit]]:
-    """Готовим текстовый блок EVIDENCE и словарь mid → Hit для дальнейшей валидации."""
-    lines: list[str] = []
+    """EVIDENCE с полным текстом сообщений (не обрезанным до одной строки)."""
+    max_chars = _evidence_msg_max_chars()
+    lines: list[str] = [
+        "Читай **полный text** каждого сообщения целиком.",
+        "Различай: «осталось/ещё набрать X XP» (личный прогресс автора) ≠ "
+        "«для N уровня нужно X XP всего» (общий порог).",
+        "Не подставляй личный дельта-XP как ответ на общий вопрос.",
+    ]
     by_mid: dict[str, Hit] = {}
+
     for ev in evidence_list:
         if not ev.hits:
             lines.append(f"### Подвопрос: {ev.subquery}\n(нет релевантных сообщений)")
             continue
+
         lines.append(f"### Подвопрос: {ev.subquery}")
         for h in ev.hits:
             by_mid[h.mid] = h
-            txt = (h.msg or "").replace("\n", " ").strip()
-            if len(txt) > 600:
-                txt = txt[:597] + "…"
-            ts = h.ts or "—"
-            lines.append(
-                f"- mid={h.mid} | room={h.room_kind}/{h.room_name} | "
-                f"@{h.user or '—'} | {ts}\n"
-                f"  permalink: {h.permalink}\n"
-                f"  text: {txt}"
-            )
+            prefix = "  ↳ " if h.is_thread_reply else ""
+            lines.extend(_format_hit_block(h, max_chars=max_chars, indent=prefix))
         lines.append("")
+
+    if not by_mid:
+        lines.insert(
+            0,
+            "**EVIDENCE пуст или без сообщений.** Ответь по RAG_CONTEXT; cited_mids=[].",
+        )
+
     return "\n".join(lines), by_mid
 
 
@@ -224,18 +218,35 @@ def _build_answer_convo(
     evidence_text: str,
     rag_text: str,
     tail_instruction: str,
+    rag_only: bool = False,
+    evidence_empty: bool = False,
+    rc_unavailable: bool = False,
+    operational_empty: bool = False,
 ) -> list[BaseMessage]:
     convo: list[BaseMessage] = [SystemMessage(content=system_prompt)] + list(history)
-    convo.append(
-        HumanMessage(
-            content=(
-                f"Вопрос: {user_question}\n\n"
-                + (f"RAG_CONTEXT (справка по теме; используй как фон):\n{rag_text}\n\n" if rag_text else "")
-                + f"EVIDENCE (фактическая база):\n{evidence_text}\n\n"
-                + f"{tail_instruction}"
-            )
+    body = f"Вопрос: {user_question}\n\n"
+    if rc_unavailable:
+        body += (
+            "Статус Rocket.Chat: сервер недоступен, поиск по сообщениям не выполнялся.\n\n"
         )
-    )
+    elif operational_empty:
+        body += (
+            "Статус Rocket.Chat: дайджест/объявления на сегодня в EVIDENCE не найдены. "
+            "RAG_CONTEXT для оперативного ответа **не использовать** — только честное "
+            "«нет данных».\n\n"
+        )
+    if rag_text and not operational_empty:
+        if rc_unavailable or rag_only:
+            rag_label = "RAG_CONTEXT (единственный источник фактов):"
+        elif evidence_empty:
+            rag_label = "RAG_CONTEXT (основной источник — EVIDENCE пуст):"
+        else:
+            rag_label = "RAG_CONTEXT (справка; fallback если EVIDENCE не по теме):"
+        body += f"{rag_label}\n{rag_text}\n\n"
+    if not rag_only:
+        body += f"EVIDENCE (фактическая база):\n{evidence_text}\n\n"
+    body += tail_instruction
+    convo.append(HumanMessage(content=body))
     return convo
 
 
@@ -271,6 +282,10 @@ def _invoke_structured_answer(
     user_question: str,
     evidence_text: str,
     rag_text: str,
+    rag_only: bool = False,
+    evidence_empty: bool = False,
+    rc_unavailable: bool = False,
+    operational_empty: bool = False,
 ) -> tuple[FinalAnswer | None, str]:
     """Пробует structured output двумя официальными режимами GigaChat.
 
@@ -284,21 +299,29 @@ def _invoke_structured_answer(
     attempts: tuple[tuple[str, str], ...] = (
         (
             "function_calling",
-            "Ответь через схему FinalAnswer. Не печатай схему текстом.",
+            ANSWER_STRUCTURED_TAIL,
         ),
         (
             "json_mode",
-            "Ответь через схему FinalAnswer." + _JSON_MODE_NOTE,
+            ANSWER_STRUCTURED_TAIL + JSON_MODE_NOTE,
         ),
+    )
+    system = build_answer_system_prompt(
+        rag_only=rag_only,
+        rc_unavailable=rc_unavailable,
     )
     for method, instruction in attempts:
         convo = _build_answer_convo(
-            system_prompt=_SYSTEM_PROMPT + (_JSON_MODE_NOTE if method == "json_mode" else ""),
+            system_prompt=system + (JSON_MODE_NOTE if method == "json_mode" else ""),
             history=history,
             user_question=user_question,
             evidence_text=evidence_text,
             rag_text=rag_text,
             tail_instruction=instruction,
+            rag_only=rag_only,
+            evidence_empty=evidence_empty,
+            rc_unavailable=rc_unavailable,
+            operational_empty=operational_empty,
         )
         try:
             structured_llm = llm.with_structured_output(
@@ -503,6 +526,32 @@ def _strip_structured_envelope(text: str) -> str:
     return cleaned or text
 
 
+_NO_EVIDENCE_ANSWER_RE = re.compile(
+    r"(?:"
+    r"в\s+(?:доступных\s+)?сообщениях\s+нет"
+    r"|нет\s+(?:данных|информации)\s+(?:о|по)"
+    r"|нет\s+объявлений"
+    r"|не\s+(?:наш[ëе]л|найдено|удалось\s+найти)"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def _answer_indicates_no_evidence(text: str) -> bool:
+    return bool(_NO_EVIDENCE_ANSWER_RE.search(text or ""))
+
+
+def _strip_proactive_tail_when_no_data(text: str) -> str:
+    """Убираем «Могу ещё подсказать» при ответе «нет данных»."""
+    if not _answer_indicates_no_evidence(text):
+        return text
+    marker = "**Могу ещё подсказать:**"
+    idx = text.find(marker)
+    if idx >= 0:
+        return text[:idx].rstrip()
+    return text
+
+
 def _resolve_sources(
     *,
     cited_mids: list[str],
@@ -510,8 +559,9 @@ def _resolve_sources(
     evidence_list: list[Evidence],
     fallback_top_per_subquery: int = 3,
     fallback_max: int = 6,
+    allow_fallback: bool = True,
 ) -> list[str]:
-    """Cited_mids → permalink-и; пустой список — fallback на топ-hit-ы по подвопросам."""
+    """Cited_mids → permalink-и; пустой список — опциональный fallback на топ-hit-ы."""
     sources: list[str] = []
     seen: set[str] = set()
     for mid in cited_mids:
@@ -521,6 +571,8 @@ def _resolve_sources(
             sources.append(h.permalink)
     if sources:
         return sources
+    if not allow_fallback:
+        return []
 
     for ev in evidence_list:
         for h in ev.hits[:fallback_top_per_subquery]:
@@ -541,6 +593,8 @@ def generate_answer(
     user_question: str,
     evidence_list: list[Evidence],
     rag_chunks: list[dict] | None = None,
+    rag_only: bool = False,
+    rc_unavailable: bool = False,
 ) -> tuple[str, list[str]]:
     """Возвращает `(markdown, sources)` с серверно-сформированным блоком «Источники».
 
@@ -549,10 +603,29 @@ def generate_answer(
     output формате `FinalAnswer`, чтобы пользователю не утекали технические mid.
     """
     evidence_text, by_mid = _format_evidence(evidence_list)
+    if rc_unavailable or rag_only:
+        if rc_unavailable:
+            evidence_text = "(Rocket.Chat недоступен — поиск по сообщениям не выполнялся)"
+        else:
+            evidence_text = "(поиск по Rocket.Chat не выполнялся)"
+        by_mid = {}
     rag_text = rag_context_text(rag_chunks)
+    evidence_empty = not rag_only and not rc_unavailable and not by_mid
+    operational_empty = (
+        not rag_only
+        and not rc_unavailable
+        and evidence_empty
+        and is_operational_campus_question(user_question)
+    )
+    if operational_empty:
+        rag_text = ""
 
     log.info(
-        "answer: history=%s evidence_groups=%s evidence_msgs=%s rag_chunks=%s",
+        "answer: rag_only=%s rc_unavailable=%s operational_empty=%s evidence_empty=%s history=%s evidence_groups=%s evidence_msgs=%s rag_chunks=%s",
+        rag_only,
+        rc_unavailable,
+        operational_empty,
+        evidence_empty,
         len(history),
         len(evidence_list),
         len(by_mid),
@@ -570,6 +643,10 @@ def generate_answer(
         user_question=user_question,
         evidence_text=evidence_text,
         rag_text=rag_text,
+        rag_only=rag_only,
+        evidence_empty=evidence_empty,
+        rc_unavailable=rc_unavailable,
+        operational_empty=operational_empty,
     )
     if result is not None:
         answer_md = (result.answer_markdown or "").strip()
@@ -580,15 +657,19 @@ def generate_answer(
         log.warning("answer: all structured modes failed, fallback to plain markdown")
         try:
             plain_convo = _build_answer_convo(
-                system_prompt=_PLAIN_SYSTEM_PROMPT,
+                system_prompt=build_answer_plain_prompt(
+                    rag_only=rag_only,
+                    rc_unavailable=rc_unavailable,
+                ),
                 history=history,
                 user_question=user_question,
                 evidence_text=evidence_text,
                 rag_text=rag_text,
-                tail_instruction=(
-                    "Ответь обычным Markdown для пользователя. "
-                    "Не используй служебные названия схем/полей и не добавляй блок источников."
-                ),
+                tail_instruction=ANSWER_PLAIN_TAIL,
+                rag_only=rag_only,
+                evidence_empty=evidence_empty,
+                rc_unavailable=rc_unavailable,
+                operational_empty=operational_empty,
             )
             response = invoke_with_retry(llm.invoke, plain_convo, label="answer.plain")
             raw = getattr(response, "content", "") or ""
@@ -618,19 +699,25 @@ def generate_answer(
     cleaned = _strip_known_mid_lines(cleaned, by_mid.keys())
     cleaned = _strip_empty_inline_tech_suffixes(cleaned)
     cleaned = _strip_existing_sources_block(cleaned).rstrip()
+    cleaned = _strip_proactive_tail_when_no_data(cleaned)
 
     # Если structured output не сработал — попробуем восстановить cited_mids
     # по подстрокам (mid Rocket.Chat — короткий ASCII; ложные срабатывания маловероятны).
     if not cited_mids and not structured_ok:
         cited_mids = _extract_known_mids(answer_md, by_mid.keys())
 
-    sources = _resolve_sources(
+    allow_source_fallback = not (
+        (structured_ok and not cited_mids)
+        or (not cited_mids and _answer_indicates_no_evidence(cleaned))
+    )
+    sources = [] if rag_only else _resolve_sources(
         cited_mids=cited_mids,
         by_mid=by_mid,
         evidence_list=evidence_list,
+        allow_fallback=allow_source_fallback,
     )
 
-    final_md = cleaned + _build_sources_section(sources)
+    final_md = cleaned if rag_only else cleaned + _build_sources_section(sources)
 
     log.info(
         "answer: structured=%s method=%s chars=%s sources=%s cited=%s",
