@@ -1,12 +1,9 @@
 """Лемматизация и генерация коротких поисковых строк для chat.search.
 
-`chat.search` Rocket.Chat работает по подстроке, поэтому пользовательский запрос
-вида «А где состоится большой карьерный день и во сколько начало?» как searchText
-бесполезен. Поэтому делаем два шага:
-
-1) `pymorphy3` — приводит русские слова к нормальной форме (для подсказки LLM).
-2) LLM (structured output) — генерит 2–4 коротких searchText на 1–3 слова,
-   нацеленных на подстроку, которая, скорее всего, встречается в сообщении.
+Rocket.Chat `chat.search` понимает текстовый поиск и команды (`on:DD/MM/YYYY`).
+Длинный вопрос пользователя как searchText бесполезен — LLM генерирует 2–4
+коротких варианта по смыслу подвопроса; при scope=today добавляется только
+механический `on:дата`.
 """
 
 from __future__ import annotations
@@ -17,8 +14,15 @@ from functools import lru_cache
 
 from langchain_gigachat.chat_models import GigaChat
 
+from src.campus_intent import (
+    TODAY_DIGEST_SEARCH_ANCHORS,
+    is_broad_campus_today,
+)
 from src.llm_gate import invoke_with_retry
+from src.pipeline.rag_faiss import rag_context_text
+from src.prompts import build_expand_prompt
 from src.rc.schemas import SearchQueries
+from src.temporal import rc_date_anchor
 
 log = logging.getLogger("s21.pipeline.expand_query")
 
@@ -55,22 +59,21 @@ def lemmatize_keywords(text: str, max_keywords: int = 8) -> list[str]:
     return out
 
 
-_SYSTEM_PROMPT = (
-    "Ты составляешь поисковые строки для Rocket.Chat (поиск по подстроке).\n"
-    "Тебе дан подвопрос и список лемм-подсказок.\n"
-    "Верни 2–4 разных поисковых строки длиной 1–3 слова — таких, чтобы их "
-    "подстрочное вхождение с высокой вероятностью попало в сообщение об "
-    "интересующем событии/теме.\n"
-    "Правила:\n"
-    "  • без знаков препинания и кавычек;\n"
-    "  • используй имена собственные/ключевые термины (карьерный день, GitVerse, "
-    "продакт-менеджмент и т.п.);\n"
-    "  • НЕ повторяй вариации одного слова в разных формах — пусть варианты "
-    "перекрывают разные аспекты;\n"
-    "  • избегай служебных слов (про, для, как, что, когда);\n"
-    "  • разные варианты — разные ракурсы (название, дата/период, площадка/чат).\n"
-    "Отвечай только согласно схеме SearchQueries."
-)
+def _merge_queries(primary: list[str], extra: list[str], *, limit: int) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for q in primary + extra:
+        s = (q or "").strip()
+        if not s:
+            continue
+        key = s.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(s)
+        if len(out) >= limit:
+            break
+    return out
 
 
 def expand_query(
@@ -78,32 +81,54 @@ def expand_query(
     llm: GigaChat,
     subquery: str,
     target: int = 3,
+    rag_chunks: list[dict] | None = None,
+    intent_scope: str | None = None,
 ) -> list[str]:
     lemmas = lemmatize_keywords(subquery)
-    log.info(f"Lemmas: {lemmas}")
-    log.info(f"Subquery: {subquery}")
-    log.info(f"Target: {target}")
+    limit = max(target, 2)
+    rag_text = rag_context_text(rag_chunks)
+
     prompt = (
         f"Подвопрос: {subquery}\n"
-        f"Леммы-подсказки: {', '.join(lemmas) if lemmas else '—'}\n"
-        f"Сгенерируй ровно {min(max(target, 2), 4)} поисковых строк."
+        f"Леммы-подсказки: {', '.join(lemmas) if lemmas else '—'}"
+    )
+    if rag_text:
+        prompt += (
+            "\n\nRAG_CONTEXT (термины и синонимы Школы 21 — для queries, "
+            "не добавляй новых фактов):\n"
+            f"{rag_text}"
+        )
+    prompt += (
+        f"\n\nСгенерируй scope и {min(max(target, 2), 4)} поисковых строк для Rocket.Chat."
     )
     structured = llm.with_structured_output(SearchQueries)
+    scope = "general"
+    items: list[str] = []
     try:
         sq: SearchQueries = invoke_with_retry(
             structured.invoke,
-            [("system", _SYSTEM_PROMPT), ("human", prompt)],
+            [("system", build_expand_prompt()), ("human", prompt)],
             label="expand_query",
         )
+        scope = sq.scope or "general"
         items = list(sq.queries or [])
     except Exception:
         log.exception("expand_query: structured_output failed, fallback к леммам")
-        items = []
+
+    if intent_scope == "today":
+        scope = "today"
 
     if not items:
-        # fallback: первые 1–2 значимых леммы
         items = lemmas[:2] or [subquery]
 
-    items = items[: max(target, 2)]
-    log.info("expand_query: subquery=%r → %s", subquery, items)
+    if scope == "today":
+        anchors = [rc_date_anchor()]
+        if is_broad_campus_today(subquery):
+            anchors.extend(TODAY_DIGEST_SEARCH_ANCHORS)
+        limit_today = min(8, max(limit, 4) + len(anchors))
+        items = _merge_queries(anchors, items, limit=limit_today)
+    else:
+        items = items[:limit]
+
+    log.info("expand_query: subquery=%r scope=%s → %s", subquery, scope, items)
     return items

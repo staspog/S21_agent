@@ -60,9 +60,17 @@ async def expand_threads(
             tmid=tmid, room=room, count=per_thread_count
         )
 
-    fetched: list[list[Hit]] = list(
-        await asyncio.gather(*(_one(r, t) for r, t in targets))
+    fetched_raw = await asyncio.gather(
+        *(_one(r, t) for r, t in targets),
+        return_exceptions=True,
     )
+    fetched: list[list[Hit]] = []
+    for item in fetched_raw:
+        if isinstance(item, BaseException):
+            log.warning("threads: fetch failed: %s", item)
+            fetched.append([])
+        else:
+            fetched.append(item)
 
     existing_mids = {h.mid for h in hits}
     extras: list[Hit] = []

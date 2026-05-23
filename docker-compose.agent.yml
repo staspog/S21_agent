@@ -14,6 +14,8 @@ services:
       - ROCKETCHAT_PASSWORD=${ROCKETCHAT_PASSWORD:-}
       - RC_TIMEOUT_CONNECT_S=${RC_TIMEOUT_CONNECT_S:-}
       - RC_TIMEOUT_READ_S=${RC_TIMEOUT_READ_S:-}
+      - RC_SEARCH_TIMEOUT_S=${RC_SEARCH_TIMEOUT_S:-}
+      - RC_THREAD_TIMEOUT_S=${RC_THREAD_TIMEOUT_S:-}
       - RC_HTTP_CONCURRENCY=${RC_HTTP_CONCURRENCY:-}
       - RC_CATALOG_TTL_S=${RC_CATALOG_TTL_S:-}
       - RC_CATALOG_PAGE_SIZE=${RC_CATALOG_PAGE_SIZE:-}
@@ -28,11 +30,20 @@ services:
       - RC_THREAD_EXPAND_TOP=${RC_THREAD_EXPAND_TOP:-}
       - RC_THREAD_MESSAGES_COUNT=${RC_THREAD_MESSAGES_COUNT:-}
       - RC_RERANKER_MODEL=${RC_RERANKER_MODEL:-}
+      - RC_RERANK_MODE=${RC_RERANK_MODE:-}
+      - RC_RERANK_MAX_CANDIDATES=${RC_RERANK_MAX_CANDIDATES:-}
+      - RAG_TOPK=${RAG_TOPK:-}
+      - RAG_RERANK_TOP=${RAG_RERANK_TOP:-}
+      - OMP_NUM_THREADS=${OMP_NUM_THREADS:-2}
+      - MKL_NUM_THREADS=${MKL_NUM_THREADS:-2}
+      - TORCH_NUM_THREADS=${TORCH_NUM_THREADS:-2}
       - ASK_TIMEOUT_S=${ASK_TIMEOUT_S:-}
     volumes:
       # Код из rsync на хосте; образ держит только зависимости (сборка только при смене Dockerfile/requirements).
       - ./src:/app/src:ro
       - ./main.py:/app/main.py:ro
+      # Dev: локальный faiss_store без пересборки образа (раскомментировать):
+      # - ./faiss_store:/app/faiss_store:ro
     restart: unless-stopped
     networks:
       - s21_agent_network
