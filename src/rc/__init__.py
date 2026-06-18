@@ -7,7 +7,6 @@ from .schemas import (
     FinalAnswer,
     Hit,
     Room,
-    RoomSelection,
     SearchQueries,
     SubqueryPlan,
 )
@@ -19,7 +18,6 @@ __all__ = [
     "RocketChatClient",
     "RocketChatConfig",
     "Room",
-    "RoomSelection",
     "SearchQueries",
     "SubqueryPlan",
     "load_rc_config",

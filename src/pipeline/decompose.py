@@ -13,7 +13,7 @@ from langchain_gigachat.chat_models import GigaChat
 from src.llm_gate import invoke_with_retry
 from src.pipeline.rag_faiss import rag_context_text
 from src.prompts import build_decompose_prompt
-from src.rc.schemas import SubqueryPlan
+from src.rc.schemas import RagChunk, SubqueryPlan
 
 log = logging.getLogger("s21.pipeline.decompose")
 
@@ -46,7 +46,7 @@ def decompose_question(
     llm: GigaChat,
     question: str,
     max_subqueries: int = 5,
-    rag_chunks: list[dict] | None = None,
+    rag_chunks: list[RagChunk] | None = None,
 ) -> list[str]:
     """LLM → 1..N подвопросов. Никогда не возвращает пустой список."""
     q = (question or "").strip()

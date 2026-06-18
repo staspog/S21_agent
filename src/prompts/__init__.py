@@ -15,12 +15,14 @@ def _with_temporal(text: str) -> str:
     return f"{block}\n\n{text}"
 
 
-def build_answer_system_prompt(*, rag_only: bool, json_mode: bool = False, rc_unavailable: bool = False) -> str:
+def build_answer_system_prompt(*, rag_only: bool, json_mode: bool = False, rc_unavailable: bool = False, reference_topic: str | None = None, reference_campus: str | None = None) -> str:
     return _with_temporal(
         _system.build_answer_system_prompt(
             rag_only=rag_only,
             json_mode=json_mode,
             rc_unavailable=rc_unavailable,
+            reference_topic=reference_topic,
+            reference_campus=reference_campus,
         )
     )
 
