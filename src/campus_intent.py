@@ -6,7 +6,7 @@ import re
 
 _BROAD_CAMPUS_TODAY = re.compile(
     r"(?:"
-    r"что\s+(?:сегодня\s+)?(?:в\s+)?(?:кампусе|школе)"
+    r"что\s+сегодня\s+(?:в\s+)?(?:кампусе|школе)"
     r"|что\s+сегодня\b"
     r"|сегодня\s+в\s+кампусе"
     r"|кампус\s+сегодня"
@@ -19,7 +19,7 @@ _OPERATIONAL_CAMPUS = re.compile(
     r"\bсегодня\b"
     r"|кластер"
     r"|логистик"
-    r"|что\s+(?:сегодня\s+)?(?:в\s+)?(?:кампусе|школе)"
+    r"|что\s+сегодня\s+(?:в\s+)?(?:кампусе|школе)"
     r"|где\s+поработать"
     r"|мероприят(?:ие|ия)\s+(?:сегодня|в\s+кампусе)"
     r"|кампус\s+сегодня"
@@ -52,3 +52,21 @@ def infer_search_scope(text: str) -> str:
     if is_broad_campus_today(text):
         return "today"
     return "general"
+
+
+_EVENT_RC = re.compile(
+    r"(?:"
+    r"экскурс"
+    r"|мероприят"
+    r"|карьерн"
+    r"|визит(?:\s+в\s+)?(?:офис|компан)"
+    r"|офис\s+сбер"
+    r"|employer\s+meeting"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def is_event_rc_question(text: str) -> bool:
+    """Вопрос про объявление/дату события в RC (экскурсия, карьерный день и т.п.)."""
+    return bool(_EVENT_RC.search(text or ""))

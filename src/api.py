@@ -30,6 +30,7 @@ from .rc.availability import RocketChatAvailability
 from .rc.catalog import RoomCatalog
 from .rc.client import RocketChatClient
 from .rc.config import load_rc_config
+from .rc.schemas import SourceItem
 
 
 def _setup_logging() -> None:
@@ -158,13 +159,12 @@ class QueryRequest(BaseModel):
     include_sources: bool = True
     deep_search: bool = False
     rocket_search: bool = False
-    top_k: int | None = Field(default=None, exclude=True)
 
 
 class QueryResponse(BaseModel):
     answer: str
     session_id: str
-    sources: list[str] | None = None
+    sources: list[SourceItem] | None = None
 
 
 @app.post("/ask", response_model=QueryResponse)
@@ -203,15 +203,19 @@ async def ask_question(request: QueryRequest):
         if not isinstance(answer, str):
             answer = str(answer)
 
-        sources: list[str] | None = None
+        sources: list[SourceItem] | None = None
         if request.include_sources:
             srcs = list(result.get("final_sources") or [])
             seen: set[str] = set()
             sources = []
             for s in srcs:
-                if s and s not in seen:
-                    seen.add(s)
-                    sources.append(s)
+                item = SourceItem.model_validate(s)
+                if not item.url or item.url in seen:
+                    continue
+                seen.add(item.url)
+                if not item.label:
+                    item = SourceItem(url=item.url, label=item.url)
+                sources.append(item)
 
         log.info(
             "ask done session_id=%s deep=%s rocket=%s graph_s=%.3f answer_len=%s sources=%s",
@@ -236,8 +240,14 @@ async def ask_question(request: QueryRequest):
             detail="Ask processing timed out",
         ) from None
     except Exception as e:
-        log.exception("ask failed session_id=%s", session_id)
-        raise HTTPException(status_code=500, detail=str(e)) from e
+        log.exception(
+            "ask failed session_id=%s question=%r deep=%s rocket=%s",
+            session_id,
+            request.question[:120],
+            deep,
+            rocket,
+        )
+        raise HTTPException(status_code=500, detail=str(e) or type(e).__name__) from e
 
 
 @app.get("/health")

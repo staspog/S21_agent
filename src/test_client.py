@@ -15,7 +15,6 @@ def main():
 
         payload = {
             "question": user_input,
-            "top_k": 3,
             "session_id": session_id,
         }
 

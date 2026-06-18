@@ -73,7 +73,7 @@ def merge_chunks(chunk_files: list[Path], *, root: Path) -> list[dict[str, Any]]
     return all_chunks
 
 
-def corpus_hash(root: Path) -> str:
+def compute_rag_corpus_fingerprint(root: Path) -> str:
     """SHA256 over adm_info/ + corpus/ under AGENT_ROOT (deploy fingerprint)."""
     h = hashlib.sha256()
     for sub in ("adm_info", "corpus"):
@@ -89,8 +89,8 @@ def corpus_hash(root: Path) -> str:
     return h.hexdigest()
 
 
-def write_corpus_hash(root: Path, digest: str) -> None:
-    (root / ".corpus_hash").write_text(digest + "\n", encoding="utf-8")
+def write_rag_corpus_fingerprint(root: Path, digest: str) -> None:
+    (root / ".rag_corpus_fingerprint").write_text(digest + "\n", encoding="utf-8")
 
 
 def apply_materials(root: Path, materials: Path) -> None:
@@ -202,9 +202,9 @@ def main() -> None:
     if not args.skip_apply:
         apply_materials(root, materials)
 
-    digest = corpus_hash(root)
-    write_corpus_hash(root, digest)
-    log.info("corpus hash: %s", digest[:12])
+    digest = compute_rag_corpus_fingerprint(root)
+    write_rag_corpus_fingerprint(root, digest)
+    log.info("rag corpus fingerprint: %s", digest[:12])
 
     if not args.skip_chunk_adm_info:
         chunk_script = SCRIPT_DIR / "chunk_adm_info.py"

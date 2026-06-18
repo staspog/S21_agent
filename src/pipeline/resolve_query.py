@@ -13,10 +13,11 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 from langchain_gigachat.chat_models import GigaChat
 
 from src.campus_intent import infer_search_scope
+from src.followup_intent import resolve_contextual_followup, resolve_followup_topic
 from src.llm_gate import invoke_with_retry
 from src.pipeline.rag_faiss import rag_context_text
 from src.prompts import build_resolve_query_prompt
-from src.rc.schemas import SearchIntent
+from src.rc.schemas import RagChunk, SearchIntent
 
 log = logging.getLogger("s21.pipeline.resolve_query")
 
@@ -68,7 +69,7 @@ def _invoke_search_intent(
     *,
     llm: GigaChat,
     messages: list[BaseMessage],
-    rag_chunks: list[dict] | None,
+    rag_chunks: list[RagChunk] | None,
 ) -> SearchIntent | None:
     rag_text = rag_context_text(rag_chunks)
     dialog = _format_dialog(messages)
@@ -103,7 +104,7 @@ def resolve_search_intent(
     *,
     llm: GigaChat,
     messages: list[BaseMessage],
-    rag_chunks: list[dict] | None = None,
+    rag_chunks: list[RagChunk] | None = None,
 ) -> tuple[str, str]:
     """История диалога → (search_query, scope) для RAG и Rocket.Chat."""
     humans = _human_messages(messages)
@@ -111,6 +112,27 @@ def resolve_search_intent(
         return "", "general"
 
     last = humans[-1]
+
+    contextual_q = resolve_contextual_followup(messages)
+    if contextual_q:
+        scope = infer_search_scope(contextual_q)
+        log.info(
+            "resolve_query: contextual follow-up scope=%s → %r",
+            scope,
+            contextual_q,
+        )
+        return contextual_q, scope
+
+    followup_q = resolve_followup_topic(messages)
+    if followup_q:
+        scope = infer_search_scope(followup_q)
+        log.info(
+            "resolve_query: affirmative follow-up scope=%s → %r",
+            scope,
+            followup_q,
+        )
+        return followup_q, scope
+
     result = _invoke_search_intent(llm=llm, messages=messages, rag_chunks=rag_chunks)
     if result is not None:
         q = (result.search_query or "").strip()
@@ -138,7 +160,7 @@ def resolve_search_query(
     *,
     llm: GigaChat,
     messages: list[BaseMessage],
-    rag_chunks: list[dict] | None = None,
+    rag_chunks: list[RagChunk] | None = None,
 ) -> str:
     """История диалога → один search_query (scope отбрасывается)."""
     query, _scope = resolve_search_intent(

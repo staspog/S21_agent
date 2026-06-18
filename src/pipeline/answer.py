@@ -25,9 +25,20 @@ import re
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 from langchain_gigachat.chat_models import GigaChat
 
-from src.campus_intent import is_operational_campus_question
+from src.campus_intent import is_event_rc_question, is_operational_campus_question
+from src.followup_intent import expand_followup_question, prune_proactive_suggestions
 from src.llm_gate import invoke_with_retry
-from src.pipeline.rag_faiss import rag_context_text
+from src.reference_intent import (
+    CANONICAL_URLS,
+    ReferenceTopic,
+    UNPUBLISHED_APPLICANT_URLS,
+)
+from src.pipeline.rag_faiss import (
+    applicant_links_footer_if_needed,
+    extract_user_facing_urls,
+    normalize_url,
+    rag_context_text,
+)
 from src.prompts import (
     ANSWER_PLAIN_TAIL,
     ANSWER_STRUCTURED_TAIL,
@@ -35,7 +46,7 @@ from src.prompts import (
     build_answer_plain_prompt,
     build_answer_system_prompt,
 )
-from src.rc.schemas import Evidence, FinalAnswer, Hit
+from src.rc.schemas import Evidence, FinalAnswer, Hit, RagChunk, SourceItem
 
 log = logging.getLogger("s21.pipeline.answer")
 
@@ -202,11 +213,131 @@ def _strip_citation_brackets(text: str) -> str:
     return "".join(out)
 
 
-def _build_sources_section(sources: list[str]) -> str:
+_MD_LINK_RE = re.compile(r"\[([^\]]*)\]\([^)]+\)")
+_MENTION_RE = re.compile(r"@\w+")
+_QA_PREFIX_RE = re.compile(r"^[QqAa]:\s*")
+
+
+def _source_label(url: str, index: int) -> str:
+    group = re.search(r"/group/([^/?#]+)", url, re.IGNORECASE)
+    if group:
+        return group.group(1)
+    channel = re.search(r"/channel/([^/?#]+)", url, re.IGNORECASE)
+    if channel:
+        return channel.group(1)
+    return f"Источник {index + 1}"
+
+
+def _normalize_msg_for_label(msg: str) -> str:
+    text = (msg or "").strip()
+    text = _MD_LINK_RE.sub(r"\1", text)
+    text = _MENTION_RE.sub("", text)
+    return " ".join(text.split())
+
+
+def _truncate_at_word(text: str, max_chars: int) -> str:
+    text = text.strip()
+    if len(text) <= max_chars:
+        return text
+    cut = text[:max_chars]
+    last_space = cut.rfind(" ")
+    if last_space > max_chars // 2:
+        cut = cut[:last_space]
+    return cut.rstrip(".,;:!?") + "…"
+
+
+def _truncate_words(text: str, *, max_words: int = 8, max_chars: int = 55) -> str:
+    words = text.split()
+    if not words:
+        return ""
+    snippet = " ".join(words[:max_words])
+    return _truncate_at_word(snippet, max_chars)
+
+
+def _label_from_msg_text(msg: str) -> str:
+    text = _normalize_msg_for_label(msg)
+    if len(text) < 8:
+        return ""
+
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    first_line = _QA_PREFIX_RE.sub("", lines[0] if lines else text).strip()
+
+    if "?" in first_line and len(first_line) <= 72:
+        q = first_line.split("?", 1)[0].strip() + "?"
+        return _truncate_at_word(q, 72)
+
+    for sep in (". ", "! ", "? "):
+        if sep in first_line:
+            first_line = first_line.split(sep, 1)[0] + sep.strip()
+            break
+
+    label = _truncate_words(first_line)
+    return label if len(label) >= 8 else ""
+
+
+def _label_from_subquery(subquery: str) -> str:
+    sq = _normalize_msg_for_label(subquery)
+    if len(sq) < 8:
+        return ""
+    if "?" in sq and len(sq) <= 72:
+        return sq if sq.endswith("?") else sq.rstrip("?") + "?"
+    return _truncate_words(sq)
+
+
+def _source_label_from_hit(
+    hit: Hit | None,
+    subquery: str | None,
+    url: str,
+    index: int,
+) -> str:
+    if hit and hit.msg:
+        label = _label_from_msg_text(hit.msg)
+        if label:
+            return label
+    if subquery:
+        label = _label_from_subquery(subquery)
+        if label:
+            return label
+    return _source_label(url, index)
+
+
+def _dedupe_source_labels(items: list[SourceItem]) -> list[SourceItem]:
+    counts: dict[str, int] = {}
+    out: list[SourceItem] = []
+    for item in items:
+        base = item.label
+        counts[base] = counts.get(base, 0) + 1
+        label = base if counts[base] == 1 else f"{base} · {counts[base]}"
+        out.append(SourceItem(url=item.url, label=label))
+    return out
+
+
+def _build_mid_subquery_map(evidence_list: list[Evidence]) -> dict[str, str]:
+    mid_to_sq: dict[str, str] = {}
+    for ev in evidence_list:
+        for h in ev.hits:
+            if h.mid and h.mid not in mid_to_sq:
+                mid_to_sq[h.mid] = ev.subquery
+    return mid_to_sq
+
+
+def _hit_to_source_item(
+    h: Hit,
+    *,
+    subquery: str | None,
+    index: int,
+) -> SourceItem | None:
+    if not h.permalink:
+        return None
+    label = _source_label_from_hit(h, subquery, h.permalink, index)
+    return SourceItem(url=h.permalink, label=label)
+
+
+def _build_sources_section(sources: list[SourceItem]) -> str:
     if not sources:
         return ""
     lines = ["", "## Источники"]
-    lines.extend(f"- {s}" for s in sources)
+    lines.extend(f"- [{item.label}]({item.url})" for item in sources)
     return "\n".join(lines)
 
 
@@ -222,9 +353,27 @@ def _build_answer_convo(
     evidence_empty: bool = False,
     rc_unavailable: bool = False,
     operational_empty: bool = False,
+    event_empty: bool = False,
+    followup: bool = False,
+    reference_topic: ReferenceTopic | str | None = None,
 ) -> list[BaseMessage]:
     convo: list[BaseMessage] = [SystemMessage(content=system_prompt)] + list(history)
     body = f"Вопрос: {user_question}\n\n"
+    if followup:
+        if " — уточнение: " in user_question:
+            body += (
+                "Контекст: короткое уточнение пользователя к предыдущему вопросу в диалоге. "
+                "Ответь **в продолжение темы** предыдущего вопроса; **не переключайся** на дайджест "
+                "«что сегодня в кампусе», если речь не о сегодняшних объявлениях.\n\n"
+            )
+        else:
+            body += (
+                "Контекст: короткое согласие пользователя на предложение из «Могу ещё подсказать». "
+                "Ответь **по новой теме** из вопроса выше; **не повторяй** предыдущий ответ ассистента.\n\n"
+            )
+    topic_hint = _REFERENCE_TOPIC_HINTS.get(str(reference_topic or ""), "")
+    if topic_hint:
+        body += f"Справочный топик: {topic_hint}\n\n"
     if rc_unavailable:
         body += (
             "Статус Rocket.Chat: сервер недоступен, поиск по сообщениям не выполнялся.\n\n"
@@ -235,7 +384,13 @@ def _build_answer_convo(
             "RAG_CONTEXT для оперативного ответа **не использовать** — только честное "
             "«нет данных».\n\n"
         )
-    if rag_text and not operational_empty:
+    elif event_empty:
+        body += (
+            "Статус Rocket.Chat: объявлений по событию/дате в EVIDENCE не найдено. "
+            "RAG_CONTEXT (календарь event-msk, старые даты) **не подмешивать** — "
+            "честно: «в Rocket.Chat не нашёл объявление»; cited_mids=[].\n\n"
+        )
+    if rag_text and not operational_empty and not event_empty:
         if rc_unavailable or rag_only:
             rag_label = "RAG_CONTEXT (единственный источник фактов):"
         elif evidence_empty:
@@ -275,6 +430,78 @@ def _parsed_final_answer(payload) -> FinalAnswer | None:
     return None
 
 
+def _strip_unpublished_applicant_links(answer: str) -> str:
+    """Убирает markdown- и голые ссылки на страницы без публикации на applicant."""
+    text = answer or ""
+    if not text.strip() or not UNPUBLISHED_APPLICANT_URLS:
+        return text
+
+    unpublished_norm = {normalize_url(u) for u in UNPUBLISHED_APPLICANT_URLS}
+
+    def _drop_markdown_link(match: re.Match[str]) -> str:
+        label = match.group(1)
+        url = match.group(2)
+        if normalize_url(url) in unpublished_norm:
+            return label.strip()
+        return match.group(0)
+
+    text = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", _drop_markdown_link, text)
+
+    for url in UNPUBLISHED_APPLICANT_URLS:
+        text = text.replace(url, "")
+
+    text = re.sub(r"[ \t]+\n", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.rstrip()
+
+
+# Метка ссылки для каждого reference-топика с каноном.
+_CANONICAL_LINK_LABELS: dict[str, str] = {
+    "clubs": "студенческие клубы",
+    "guests": "правила приглашения гостей",
+    "benefits": "скидки и бонусы",
+}
+
+_REFERENCE_TOPIC_HINTS: dict[str, str] = {
+    "guests": (
+        "Вопрос про гостей: перечисли **все** кампусы из RAG с ссылками на формы заявки. "
+        "Не ограничивайся несколькими городами. "
+        "В «Могу ещё подсказать» предлагай только темы про гостей "
+        "(провести гостя, документы, лимит гостей)."
+    ),
+    "clubs": (
+        "Перечисли все релевантные кампусы/клубы из RAG, если вопрос про клубы."
+    ),
+    "benefits": (
+        "Перечисли все релевантные города/бонусы из RAG, если вопрос про скидки."
+    ),
+}
+
+_CATALOG_REFERENCE_TOPICS = frozenset({"clubs", "benefits", "guests"})
+
+
+def _ensure_canonical_reference_link(
+    answer: str,
+    reference_topic: ReferenceTopic | str | None,
+) -> str:
+    if not reference_topic:
+        return answer
+    url = CANONICAL_URLS.get(reference_topic)
+    if not url:
+        return answer
+    norm = normalize_url(url)
+    for u in extract_user_facing_urls(answer):
+        if norm in normalize_url(u) or normalize_url(u) in norm:
+            return answer
+    if norm in normalize_url(answer):
+        return answer
+    label = _CANONICAL_LINK_LABELS.get(reference_topic, "подробнее")
+    return (
+        f"{answer.rstrip()}\n\n"
+        f"Подробнее на applicant: [{label}]({url})."
+    )
+
+
 def _invoke_structured_answer(
     *,
     llm: GigaChat,
@@ -286,6 +513,10 @@ def _invoke_structured_answer(
     evidence_empty: bool = False,
     rc_unavailable: bool = False,
     operational_empty: bool = False,
+    event_empty: bool = False,
+    reference_topic: ReferenceTopic | str | None = None,
+    reference_campus: str | None = None,
+    followup: bool = False,
 ) -> tuple[FinalAnswer | None, str]:
     """Пробует structured output двумя официальными режимами GigaChat.
 
@@ -309,6 +540,8 @@ def _invoke_structured_answer(
     system = build_answer_system_prompt(
         rag_only=rag_only,
         rc_unavailable=rc_unavailable,
+        reference_topic=reference_topic,
+        reference_campus=reference_campus,
     )
     for method, instruction in attempts:
         convo = _build_answer_convo(
@@ -322,6 +555,9 @@ def _invoke_structured_answer(
             evidence_empty=evidence_empty,
             rc_unavailable=rc_unavailable,
             operational_empty=operational_empty,
+            event_empty=event_empty,
+            followup=followup,
+            reference_topic=reference_topic,
         )
         try:
             structured_llm = llm.with_structured_output(
@@ -552,6 +788,51 @@ def _strip_proactive_tail_when_no_data(text: str) -> str:
     return text
 
 
+def _strip_trailing_artifact(text: str) -> str:
+    """Срезает висящий хвостовой артефакт structured-output.
+
+    Покрывает два системных случая в самом конце ответа: финальную строку,
+    состоящую только из `,`/`;`, и одиночную висящую `,`/`;` в конце текста
+    (например `...\\n  ,`). Идемпотентна — на уже чистом тексте no-op.
+    """
+    if not text:
+        return text or ""
+    cleaned = text.rstrip()
+    while cleaned:
+        nl = cleaned.rfind("\n")
+        last_line = cleaned[nl + 1 :].strip()
+        if last_line in {",", ";"}:
+            cleaned = cleaned[: nl if nl >= 0 else 0].rstrip()
+            continue
+        if cleaned.endswith((",", ";")):
+            cleaned = cleaned[:-1].rstrip()
+            continue
+        break
+    return cleaned
+
+
+_BENEFITS_CANONICAL = "applicant.21-school.ru/education/bonuses"
+_BENEFITS_URL_FIXES: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"applicant\.21-school\.ru/benefits\b"), _BENEFITS_CANONICAL),
+    (re.compile(r"applicant\.21-school\.ru/bonuses\b"), _BENEFITS_CANONICAL),
+)
+
+
+def _correct_benefits_url(text: str) -> str:
+    """Переписывает устаревшие benefits-URL на канонический
+    `applicant.21-school.ru/education/bonuses`.
+
+    Шаблоны привязаны к `ru/benefits` и `ru/bonuses`, которых нет в каноне
+    (`ru/education/bonuses`), поэтому уже корректный URL не трогается.
+    """
+    if not text:
+        return text or ""
+    out = text
+    for pat, repl in _BENEFITS_URL_FIXES:
+        out = pat.sub(repl, out)
+    return out
+
+
 def _resolve_sources(
     *,
     cited_mids: list[str],
@@ -560,30 +841,46 @@ def _resolve_sources(
     fallback_top_per_subquery: int = 3,
     fallback_max: int = 6,
     allow_fallback: bool = True,
-) -> list[str]:
-    """Cited_mids → permalink-и; пустой список — опциональный fallback на топ-hit-ы."""
-    sources: list[str] = []
+) -> list[SourceItem]:
+    """Cited_mids → источники с подписями; пустой список — fallback на топ-hit-ы."""
+    mid_to_subquery = _build_mid_subquery_map(evidence_list)
+    sources: list[SourceItem] = []
     seen: set[str] = set()
+
     for mid in cited_mids:
         h = by_mid.get(mid)
-        if h and h.permalink and h.permalink not in seen:
-            seen.add(h.permalink)
-            sources.append(h.permalink)
+        if not h or not h.permalink or h.permalink in seen:
+            continue
+        seen.add(h.permalink)
+        item = _hit_to_source_item(
+            h,
+            subquery=mid_to_subquery.get(mid),
+            index=len(sources),
+        )
+        if item:
+            sources.append(item)
     if sources:
-        return sources
+        return _dedupe_source_labels(sources)
     if not allow_fallback:
         return []
 
     for ev in evidence_list:
         for h in ev.hits[:fallback_top_per_subquery]:
-            if h.permalink and h.permalink not in seen:
-                seen.add(h.permalink)
-                sources.append(h.permalink)
+            if not h.permalink or h.permalink in seen:
+                continue
+            seen.add(h.permalink)
+            item = _hit_to_source_item(
+                h,
+                subquery=ev.subquery,
+                index=len(sources),
+            )
+            if item:
+                sources.append(item)
             if len(sources) >= fallback_max:
                 break
         if len(sources) >= fallback_max:
             break
-    return sources
+    return _dedupe_source_labels(sources)
 
 
 def generate_answer(
@@ -592,16 +889,24 @@ def generate_answer(
     history: list[BaseMessage],
     user_question: str,
     evidence_list: list[Evidence],
-    rag_chunks: list[dict] | None = None,
+    rag_chunks: list[RagChunk] | None = None,
     rag_only: bool = False,
     rc_unavailable: bool = False,
-) -> tuple[str, list[str]]:
+    reference_topic: ReferenceTopic | str | None = None,
+    reference_campus: str | None = None,
+    rag_first: bool = False,
+) -> tuple[str, list[SourceItem]]:
     """Возвращает `(markdown, sources)` с серверно-сформированным блоком «Источники».
 
     История сессии передаётся в промпт как есть (для контекста реплик); явный
     последний human добавляется отдельно. Сам ответ просим у LLM в structured
     output формате `FinalAnswer`, чтобы пользователю не утекали технические mid.
     """
+    effective_question = expand_followup_question(history + [
+        HumanMessage(content=user_question),
+    ], user_question)
+    followup = effective_question != user_question
+
     evidence_text, by_mid = _format_evidence(evidence_list)
     if rc_unavailable or rag_only:
         if rc_unavailable:
@@ -615,22 +920,44 @@ def generate_answer(
         not rag_only
         and not rc_unavailable
         and evidence_empty
-        and is_operational_campus_question(user_question)
+        and is_operational_campus_question(effective_question)
     )
-    if operational_empty:
+    event_empty = (
+        not rag_only
+        and not rc_unavailable
+        and evidence_empty
+        and not operational_empty
+        and is_event_rc_question(effective_question)
+    )
+    if operational_empty or event_empty:
         rag_text = ""
 
     log.info(
-        "answer: rag_only=%s rc_unavailable=%s operational_empty=%s evidence_empty=%s history=%s evidence_groups=%s evidence_msgs=%s rag_chunks=%s",
+        "answer: rag_only=%s rc_unavailable=%s rag_first=%s operational_empty=%s event_empty=%s evidence_empty=%s "
+        "reference_topic=%s reference_campus=%s history=%s evidence_groups=%s evidence_msgs=%s rag_chunks=%s followup=%s",
         rag_only,
         rc_unavailable,
+        rag_first,
         operational_empty,
+        event_empty,
         evidence_empty,
+        reference_topic or "",
+        reference_campus or "",
         len(history),
         len(evidence_list),
         len(by_mid),
         len(rag_chunks or []),
+        followup,
     )
+    rag_slugs = sorted(
+        {
+            str(ch.metadata.slug).strip()
+            for ch in (rag_chunks or [])
+            if ch.metadata.slug
+        }
+    )
+    if rag_slugs:
+        log.info("answer: rag_slugs=%s", ",".join(rag_slugs))
 
     answer_md = ""
     cited_mids: list[str] = []
@@ -640,13 +967,17 @@ def generate_answer(
     result, structured_method = _invoke_structured_answer(
         llm=llm,
         history=history,
-        user_question=user_question,
+        user_question=effective_question,
         evidence_text=evidence_text,
         rag_text=rag_text,
         rag_only=rag_only,
         evidence_empty=evidence_empty,
         rc_unavailable=rc_unavailable,
         operational_empty=operational_empty,
+        event_empty=event_empty,
+        reference_topic=reference_topic,
+        reference_campus=reference_campus,
+        followup=followup,
     )
     if result is not None:
         answer_md = (result.answer_markdown or "").strip()
@@ -662,7 +993,7 @@ def generate_answer(
                     rc_unavailable=rc_unavailable,
                 ),
                 history=history,
-                user_question=user_question,
+                user_question=effective_question,
                 evidence_text=evidence_text,
                 rag_text=rag_text,
                 tail_instruction=ANSWER_PLAIN_TAIL,
@@ -670,6 +1001,9 @@ def generate_answer(
                 evidence_empty=evidence_empty,
                 rc_unavailable=rc_unavailable,
                 operational_empty=operational_empty,
+                event_empty=event_empty,
+                followup=followup,
+                reference_topic=reference_topic,
             )
             response = invoke_with_retry(llm.invoke, plain_convo, label="answer.plain")
             raw = getattr(response, "content", "") or ""
@@ -700,6 +1034,11 @@ def generate_answer(
     cleaned = _strip_empty_inline_tech_suffixes(cleaned)
     cleaned = _strip_existing_sources_block(cleaned).rstrip()
     cleaned = _strip_proactive_tail_when_no_data(cleaned)
+    cleaned = prune_proactive_suggestions(cleaned, user_question)
+    cleaned = _strip_unpublished_applicant_links(cleaned)
+    cleaned = _strip_trailing_artifact(cleaned)
+    cleaned = _correct_benefits_url(cleaned)
+    cleaned = _ensure_canonical_reference_link(cleaned, reference_topic)
 
     # Если structured output не сработал — попробуем восстановить cited_mids
     # по подстрокам (mid Rocket.Chat — короткий ASCII; ложные срабатывания маловероятны).
@@ -709,6 +1048,7 @@ def generate_answer(
     allow_source_fallback = not (
         (structured_ok and not cited_mids)
         or (not cited_mids and _answer_indicates_no_evidence(cleaned))
+        or (reference_topic in _CATALOG_REFERENCE_TOPICS)
     )
     sources = [] if rag_only else _resolve_sources(
         cited_mids=cited_mids,
@@ -717,15 +1057,24 @@ def generate_answer(
         allow_fallback=allow_source_fallback,
     )
 
-    final_md = cleaned if rag_only else cleaned + _build_sources_section(sources)
+    applicant_footer = applicant_links_footer_if_needed(cleaned, rag_chunks)
+    if rag_only:
+        final_md = cleaned + applicant_footer
+    else:
+        final_md = cleaned + _build_sources_section(sources) + applicant_footer
 
     log.info(
-        "answer: structured=%s method=%s chars=%s sources=%s cited=%s",
+        "answer: structured=%s method=%s chars=%s sources=%s cited=%s applicant_footer=%s "
+        "reference_topic=%s reference_campus=%s rag_first=%s",
         structured_ok,
         structured_method or "none",
         len(final_md),
         len(sources),
         len(cited_mids),
+        bool(applicant_footer),
+        reference_topic or "",
+        reference_campus or "",
+        rag_first,
     )
     return final_md, sources
 

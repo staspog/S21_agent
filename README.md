@@ -60,7 +60,7 @@ START
 | `corpus/` | jsonl-чанки FAQ/ADM |
 | `adm_info/` | markdown-страницы applicant |
 | `docs/*_chunks.jsonl`, `docs.ipynb` | legacy-копии / сырые outputs |
-| `.corpus_hash` | fingerprint deploy (локально или на сервере) |
+| `.rag_corpus_fingerprint` | отпечаток adm_info/ + corpus/ для deploy (пересборка RAG) |
 | `.env` | ключи GigaChat, Rocket.Chat |
 
 Приватные материалы — в **`secrets/materials/agent/`** (монорепо, `.gitignore`):
@@ -213,7 +213,7 @@ docker compose -f docker-compose.agent.yml up -d --build
   }
   ```
 
-  Ответ: `{ "answer": "<markdown>", "session_id": "...", "sources": ["<permalink>", ...] }`.
+  Ответ: `{ "answer": "<markdown>", "session_id": "...", "sources": [{ "url": "<permalink>", "label": "<короткая подпись>" }, ...] }`.
 
 - `GET /health` — диагностика:
 

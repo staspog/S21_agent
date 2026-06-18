@@ -6,7 +6,8 @@
       ↓
     prepare            (RAG + catalog параллельно)
       ↓
-    [rocket_search?]
+    [rag_first?]  → generate (каталог clubs/benefits, skip RC)
+      ↓ else [rocket_search?]
       ↓ no                          ↓ yes
     generate (RAG-only)         decompose → fanout → per_subquery → generate
       ↓                               ↓
@@ -25,24 +26,26 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 from langchain_gigachat.chat_models import GigaChat
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, MessagesState, StateGraph
-from langgraph.types import Send
+from langgraph.types import Overwrite, Send
 
 from .campus_intent import is_broad_campus_today
+from .followup_intent import resolve_followup_topic
+from .reference_intent import detect_campus, detect_reference_topic, resolve_reference_context
 from .pipeline.answer import generate_answer
 from .pipeline.decompose import decompose_question
-from .pipeline.expand_query import expand_query
+from .pipeline.expand_query import expand_query, keyword_queries_for_search
 from .pipeline.fuse import rrf_fuse
 from .pipeline.rag_faiss import RagConfig, retrieve_rag_chunks
 from .pipeline.rerank import hybrid_rerank
 from .pipeline.resolve_query import resolve_search_intent
 from .pipeline.search import search_rooms_x_queries
-from .pipeline.select_rooms import select_rooms
+from .pipeline.select_rooms import adm_rooms_subset, select_rooms
 from .pipeline.threads import expand_threads
 from .rc.availability import RocketChatAvailability
 from .rc.catalog import RoomCatalog
 from .rc.client import RocketChatClient
 from .rc.config import RocketChatConfig
-from .rc.schemas import Evidence, Hit, Room
+from .rc.schemas import Evidence, Hit, RagChunk, Room, SourceItem
 
 log = logging.getLogger("s21.graph")
 
@@ -57,10 +60,21 @@ class AgentState(MessagesState):
     search_intent: NotRequired[str]
     search_scope: NotRequired[str]
     rag_chunks: NotRequired[list[dict]]
+    reference_topic: NotRequired[str | None]
+    reference_campus: NotRequired[str | None]
+    rag_first: NotRequired[bool]
     rooms_catalog: NotRequired[list[Room]]
     seed_rooms: NotRequired[list[Room]]
     evidence: Annotated[list[Evidence], operator.add]
-    final_sources: NotRequired[list[str]]
+    final_sources: NotRequired[list[dict[str, str]]]
+
+
+def _rag_chunks_from_state(raw: list | None) -> list[RagChunk]:
+    return [RagChunk.from_record(d) for d in (raw or [])]
+
+
+def _rag_chunks_to_state(chunks: list[RagChunk]) -> list[dict]:
+    return [c.to_record() for c in chunks]
 
 
 def _last_human_text(messages: list[BaseMessage]) -> str:
@@ -92,16 +106,23 @@ def build_rc_graph(
         messages = list(state["messages"])
         loop = asyncio.get_running_loop()
 
-        async def _rag_and_intent() -> tuple[list[dict], str, str]:
+        async def _rag_and_intent() -> tuple[list[RagChunk], str, str, str | None, str | None]:
             last_q = _last_human_text(messages)
-            rag_chunks = await loop.run_in_executor(
-                None,
-                lambda: retrieve_rag_chunks(
-                    query=last_q,
-                    cfg=RagConfig.from_env(),
+            rag_query = resolve_followup_topic(messages) or last_q
+            ref_topic = detect_reference_topic(rag_query)
+            ref_campus = detect_campus(rag_query) if ref_topic else None
+            rag_cfg = RagConfig.from_env()
+
+            def _retrieve(q: str) -> list[RagChunk]:
+                return retrieve_rag_chunks(
+                    query=q,
+                    cfg=rag_cfg,
                     reranker_model_name=rc_cfg.reranker_model,
-                ),
-            )
+                    reference_topic=ref_topic,
+                    reference_campus=ref_campus,
+                )
+
+            rag_chunks = await loop.run_in_executor(None, lambda: _retrieve(rag_query))
             intent, scope = await loop.run_in_executor(
                 None,
                 lambda: resolve_search_intent(
@@ -111,20 +132,30 @@ def build_rc_graph(
                 ),
             )
             if intent and intent.strip().lower() != last_q.strip().lower():
-                rag_chunks = await loop.run_in_executor(
-                    None,
-                    lambda q=intent: retrieve_rag_chunks(
-                        query=q,
-                        cfg=RagConfig.from_env(),
-                        reranker_model_name=rc_cfg.reranker_model,
-                    ),
-                )
-            return rag_chunks, intent, scope
+                rag_chunks = await loop.run_in_executor(None, lambda q=intent: _retrieve(q))
+            return rag_chunks, intent, scope, ref_topic, ref_campus
 
-        rag_chunks, search_intent, search_scope = await _rag_and_intent()
+        rag_chunks, search_intent, search_scope, reference_topic, reference_campus = await _rag_and_intent()
+        topic, campus, rag_first = resolve_reference_context(
+            _last_human_text(messages),
+            rag_chunks,
+            bool(state.get("rocket_search")),
+        )
+        if campus and not reference_campus:
+            reference_campus = campus
+        if topic and not reference_topic:
+            reference_topic = topic
         rooms: list[Room] = []
         seeds: list[Room] = []
         rocket = bool(state.get("rocket_search"))
+        if rag_first:
+            log.info(
+                "graph: prepare rag_first skip RC topic=%s campus=%s",
+                reference_topic,
+                reference_campus,
+            )
+            rocket = False
+
         rc_unavailable = False
 
         if rocket:
@@ -165,6 +196,13 @@ def build_rc_graph(
         else:
             log.info("graph: prepare skip RC catalog (rocket_search=false)")
 
+        rag_slugs = sorted(
+            {
+                ch.metadata.slug.strip()
+                for ch in rag_chunks
+                if ch.metadata.slug
+            }
+        )
         _log_node_done(
             "prepare",
             t0,
@@ -175,20 +213,31 @@ def build_rc_graph(
             seeds=len(seeds),
             rocket_search=rocket,
             rc_unavailable=rc_unavailable,
+            reference_topic=reference_topic or "",
+            reference_campus=reference_campus or "",
+            rag_first=rag_first,
+            rag_slugs=",".join(rag_slugs[:5]),
         )
         out: dict = {
-            "rag_chunks": rag_chunks,
+            "rag_chunks": _rag_chunks_to_state(rag_chunks),
             "search_intent": search_intent,
             "search_scope": search_scope,
             "rooms_catalog": rooms,
             "seed_rooms": seeds,
+            "reference_topic": reference_topic,
+            "reference_campus": reference_campus,
+            "rag_first": rag_first,
+            "evidence": Overwrite([]),
         }
-        if rc_unavailable:
+        if rc_unavailable or rag_first:
             out["rocket_search"] = False
+        if rc_unavailable:
             out["rc_unavailable"] = True
         return out
 
     def route_after_prepare(state: AgentState) -> str:
+        if state.get("rag_first"):
+            return "generate"
         if state.get("rocket_search"):
             return "decompose"
         return "generate"
@@ -199,7 +248,7 @@ def build_rc_graph(
         search_intent = (state.get("search_intent") or "").strip()
         if not search_intent:
             search_intent = _last_human_text(list(state["messages"]))
-        rag_chunks = list(state.get("rag_chunks") or [])
+        rag_chunks = _rag_chunks_from_state(state.get("rag_chunks"))
         search_scope = (state.get("search_scope") or "general").strip()
         deep = bool(state.get("deep_search"))
         profile = rc_cfg.profile_for(deep=deep)
@@ -258,7 +307,7 @@ def build_rc_graph(
         subquery: str = payload["subquery"]
         catalog: list[Room] = payload.get("rooms_catalog") or []
         seeds: list[Room] = payload.get("seed_rooms") or []
-        rag_chunks: list[dict] = list(payload.get("rag_chunks") or [])
+        rag_chunks = _rag_chunks_from_state(payload.get("rag_chunks"))
         search_scope = (payload.get("search_scope") or "general").strip()
         deep = bool(payload.get("deep_search"))
         profile = rc_cfg.profile_for(deep=deep)
@@ -269,7 +318,6 @@ def build_rc_graph(
         rooms = await loop.run_in_executor(
             None,
             lambda: select_rooms(
-                llm=llm,
                 subquery=subquery,
                 catalog=catalog,
                 seed_rooms=seeds,
@@ -291,13 +339,46 @@ def build_rc_graph(
             ),
         )
 
-        ranked_lists = await search_rooms_x_queries(
-            client=rc_client,
-            rooms=rooms,
-            queries=queries,
-            count=profile.search_count,
-        )
-        fused = rrf_fuse(ranked_lists)
+        keyword_queries = keyword_queries_for_search(subquery, queries)
+        adm_rooms = adm_rooms_subset(rooms)
+        ranked_lists: list[list[Hit]] = []
+        phase = "full"
+
+        if adm_rooms and keyword_queries:
+            ranked_lists = await search_rooms_x_queries(
+                client=rc_client,
+                rooms=adm_rooms,
+                queries=keyword_queries,
+                count=profile.search_count,
+            )
+            fused = rrf_fuse(ranked_lists)
+            phase_a_hits = len(fused)
+            log.info(
+                "per_subquery: phase_a rooms=%s queries=%s hits=%s",
+                [r.name for r in adm_rooms],
+                keyword_queries,
+                phase_a_hits,
+            )
+            if phase_a_hits:
+                phase = "adm_keywords"
+            else:
+                phase_b_rooms = rooms[: min(4, len(rooms))]
+                ranked_lists = await search_rooms_x_queries(
+                    client=rc_client,
+                    rooms=phase_b_rooms,
+                    queries=keyword_queries,
+                    count=profile.search_count,
+                )
+                fused = rrf_fuse(ranked_lists)
+                phase = "keywords_4rooms"
+        else:
+            ranked_lists = await search_rooms_x_queries(
+                client=rc_client,
+                rooms=rooms,
+                queries=queries,
+                count=profile.search_count,
+            )
+            fused = rrf_fuse(ranked_lists)
 
         top: list[Hit] = await loop.run_in_executor(
             None,
@@ -327,6 +408,9 @@ def build_rc_graph(
             q=subquery[:40],
             hits=len(with_threads),
             mode=profile.rerank_mode,
+            phase=phase,
+            rooms=[r.name for r in rooms],
+            queries=queries,
         )
         return {"evidence": [Evidence(subquery=subquery, hits=with_threads)]}
 
@@ -353,7 +437,9 @@ def build_rc_graph(
         raw_ev = list(state.get("evidence") or [])
         ev_list = _dedupe_across_subqueries(raw_ev) if rocket else []
         history = list(state["messages"])[:-1]
-        rag_chunks = list(state.get("rag_chunks") or [])
+        rag_chunks = _rag_chunks_from_state(state.get("rag_chunks"))
+        reference_topic = state.get("reference_topic")
+        reference_campus = state.get("reference_campus")
         loop = asyncio.get_running_loop()
         answer_text, sources = await loop.run_in_executor(
             None,
@@ -365,6 +451,9 @@ def build_rc_graph(
                 rag_chunks=rag_chunks,
                 rag_only=rag_only,
                 rc_unavailable=rc_unavailable,
+                reference_topic=reference_topic,
+                reference_campus=reference_campus,
+                rag_first=bool(state.get("rag_first")),
             ),
         )
         _log_node_done(
@@ -372,10 +461,13 @@ def build_rc_graph(
             t0,
             rag_only=rag_only,
             sources=len(sources),
+            reference_topic=reference_topic or "",
+            reference_campus=reference_campus or "",
+            rag_first=bool(state.get("rag_first")),
         )
         return {
             "messages": [AIMessage(content=answer_text)],
-            "final_sources": sources,
+            "final_sources": [s.model_dump() for s in sources],
         }
 
     g: StateGraph = StateGraph(AgentState)

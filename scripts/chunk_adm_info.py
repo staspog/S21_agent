@@ -8,18 +8,21 @@ import json
 import logging
 import os
 import re
-from dataclasses import dataclass
+import sys
 from pathlib import Path
-from typing import Any
 
-log = logging.getLogger("chunk_adm_info")
+from pydantic import BaseModel, ConfigDict, Field
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+from src.rc.schemas import RagChunk, RagChunkMetadata
+
 DEFAULT_AGENT_ROOT = Path(os.getenv("AGENT_ROOT", str(ROOT))).resolve()
 DEFAULT_ADM_INFO_DIR = DEFAULT_AGENT_ROOT / "adm_info"
 DEFAULT_OUT = DEFAULT_AGENT_ROOT / "corpus" / "adm_info_chunks.jsonl"
 
-SKIP_FILES = {"README.md", "external_links.md"}
+SKIP_FILES = {"README.md"}
 
 ORIGINAL_RE = re.compile(
     r"^>\s*Оригинал:\s*\[[^\]]+\]\(([^)]+)\)\s*$",
@@ -32,8 +35,49 @@ IMAGE_RE = re.compile(r"!\[([^\]]*)\]\(([^)]+)\)")
 MOJIBAKE_RE = re.compile(r"[ÃÐÑ�]")
 
 
-@dataclass
-class SectionBlock:
+log = logging.getLogger("chunk_adm_info")
+
+
+class AdmPage(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    rel_path: str
+    slug: str
+    page_title: str
+    page_url: str
+
+
+class AdmPageRegistry(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    by_rel: dict[str, AdmPage] = Field(default_factory=dict)
+
+    def lookup_rel(self, rel: str) -> AdmPage | None:
+        return self.by_rel.get(rel.replace("\\", "/"))
+
+    def find_page(self, rel: str) -> AdmPage | None:
+        rel = rel.replace("\\", "/").strip("/")
+        candidates = [rel]
+        if rel.endswith(".md"):
+            if rel.endswith("/index.md"):
+                candidates.append(rel[: -len("/index.md")])
+            else:
+                candidates.append(rel[: -len(".md")] + "/index.md")
+        else:
+            candidates.append(f"{rel}/index.md")
+            candidates.append(f"{rel}.md")
+        seen: set[str] = set()
+        for cand in candidates:
+            if cand in seen:
+                continue
+            seen.add(cand)
+            page = self.lookup_rel(cand)
+            if page:
+                return page
+        return None
+
+
+class SectionBlock(BaseModel):
     section: str
     text: str
 
@@ -62,35 +106,180 @@ def split_text_words(
     return chunks
 
 
-def normalize_markdown(text: str) -> str:
-    text = LINK_RE.sub(r"\1 (\2)", text)
-    text = IMAGE_RE.sub(lambda m: (m.group(1) or "image").strip() + f" ({m.group(2)})", text)
+def slug_from_path(path: Path, adm_info_dir: Path) -> str:
+    rel = path.relative_to(adm_info_dir)
+    if rel.name == "index.md":
+        parent = rel.parent
+        return parent.as_posix() if parent != Path(".") else "index"
+    return rel.with_suffix("").as_posix()
+
+
+def page_url_from_raw(raw: str, slug: str) -> str:
+    """Published applicant URL from ``> Оригинал:``; else empty (internal page only)."""
+    url_m = ORIGINAL_RE.search(raw)
+    if url_m:
+        return url_m.group(1).strip()
+    return ""
+
+
+def page_source_id(page_url: str, slug: str) -> str:
+    if page_url.startswith(("http://", "https://")):
+        return page_url
+    return f"adm_info:{slug}"
+
+
+def page_title_from_raw(raw: str, slug: str) -> str:
+    title_m = TITLE_RE.search(raw)
+    return title_m.group(1).strip() if title_m else slug
+
+
+def collect_markdown_pages(adm_info_dir: Path) -> list[Path]:
+    pages = sorted(adm_info_dir.glob("**/*.md"))
+    return [p for p in pages if p.name not in SKIP_FILES]
+
+
+def build_page_registry(pages: list[Path], adm_info_dir: Path) -> AdmPageRegistry:
+    by_rel: dict[str, AdmPage] = {}
+    for path in pages:
+        raw = path.read_text(encoding="utf-8")
+        slug = slug_from_path(path, adm_info_dir)
+        rel = path.relative_to(adm_info_dir).as_posix()
+        by_rel[rel] = AdmPage(
+            rel_path=rel,
+            slug=slug,
+            page_title=page_title_from_raw(raw, slug),
+            page_url=page_url_from_raw(raw, slug),
+        )
+    return AdmPageRegistry(by_rel=by_rel)
+
+
+def _split_href(href: str) -> tuple[str, str]:
+    href = href.strip()
+    if "#" not in href:
+        return href, ""
+    path, anchor = href.split("#", 1)
+    anchor = f"#{anchor}" if anchor else ""
+    return path.strip(), anchor
+
+
+def _slug_from_href_path(href_path: str, from_page: Path, adm_info_dir: Path) -> str:
+    target = (from_page.parent / href_path).resolve()
+    try:
+        rel = target.relative_to(adm_info_dir.resolve())
+    except ValueError:
+        rel = Path(href_path)
+    if rel.suffix == ".md":
+        return slug_from_path(adm_info_dir / rel, adm_info_dir)
+    return slug_from_path(adm_info_dir / rel / "index.md", adm_info_dir)
+
+
+def resolve_href(
+    href: str,
+    *,
+    from_page: Path,
+    adm_info_dir: Path,
+    registry: AdmPageRegistry,
+) -> tuple[str, str | None]:
+    """Resolve markdown href to (url, target_page_title)."""
+    href_path, anchor = _split_href(href)
+    if not href_path:
+        return anchor or href, None
+
+    if href_path.startswith(("http://", "https://", "mailto:", "tel:")):
+        return href_path + anchor, None
+
+    if href_path.startswith("#"):
+        current = registry.lookup_rel(from_page.relative_to(adm_info_dir).as_posix())
+        if current:
+            return current.page_url + href_path, current.page_title
+        return href, None
+
+    try:
+        target = (from_page.parent / href_path).resolve()
+        rel = target.relative_to(adm_info_dir.resolve()).as_posix()
+    except ValueError:
+        log.warning(
+            "link outside adm_info: %r in %s",
+            href,
+            from_page.relative_to(adm_info_dir),
+        )
+        slug = _slug_from_href_path(href_path, from_page, adm_info_dir)
+        return f"{slug}{anchor}", None
+
+    page = registry.find_page(rel)
+    if page:
+        return page.page_url + anchor, page.page_title
+
+    slug = _slug_from_href_path(href_path, from_page, adm_info_dir)
+    log.warning(
+        "unresolved adm_info link %r in %s -> %s",
+        href,
+        from_page.relative_to(adm_info_dir),
+        slug,
+    )
+    return f"{slug}{anchor}", None
+
+
+def _format_resolved_link(label: str, url: str, target_title: str | None) -> str:
+    label = label.strip()
+    if not url:
+        if target_title and target_title.casefold() != label.casefold():
+            return f"{label} (раздел «{target_title}»)"
+        return label
+    if target_title and target_title.casefold() != label.casefold():
+        return f"{label} ({url}, раздел «{target_title}»)"
+    return f"{label} ({url})"
+
+
+def normalize_markdown(
+    text: str,
+    *,
+    from_page: Path,
+    adm_info_dir: Path,
+    registry: AdmPageRegistry,
+) -> str:
+    def _link_sub(match: re.Match[str]) -> str:
+        label = match.group(1)
+        href = match.group(2)
+        url, target_title = resolve_href(
+            href,
+            from_page=from_page,
+            adm_info_dir=adm_info_dir,
+            registry=registry,
+        )
+        return _format_resolved_link(label, url, target_title)
+
+    text = LINK_RE.sub(_link_sub, text)
+    text = IMAGE_RE.sub(
+        lambda m: (m.group(1) or "image").strip() + f" ({m.group(2)})",
+        text,
+    )
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
 
 
-def slug_from_path(path: Path, adm_info_dir: Path) -> str:
-    rel = path.relative_to(adm_info_dir)
-    parts = list(rel.parts)
-    if parts and parts[-1] == "index.md":
-        parts = parts[:-1]
-    return "/".join(parts) if parts else rel.stem
-
-
-def parse_page(path: Path, adm_info_dir: Path) -> tuple[str, str, list[SectionBlock]]:
+def parse_page(
+    path: Path,
+    adm_info_dir: Path,
+    registry: AdmPageRegistry,
+) -> tuple[str, str, list[SectionBlock]]:
     raw = path.read_text(encoding="utf-8")
     slug = slug_from_path(path, adm_info_dir)
-
-    title_m = TITLE_RE.search(raw)
-    page_title = title_m.group(1).strip() if title_m else slug
-
-    url_m = ORIGINAL_RE.search(raw)
-    page_url = url_m.group(1).strip() if url_m else f"https://applicant.21-school.ru/{slug}"
+    page = registry.lookup_rel(path.relative_to(adm_info_dir).as_posix())
+    page_title = page.page_title if page else page_title_from_raw(raw, slug)
+    page_url = page.page_url if page else page_url_from_raw(raw, slug)
 
     body = raw
+    title_m = TITLE_RE.search(raw)
     if title_m:
         body = body[title_m.end() :]
     body = ORIGINAL_RE.sub("", body, count=1).strip()
+
+    norm_kw = {
+        "from_page": path,
+        "adm_info_dir": adm_info_dir,
+        "registry": registry,
+    }
 
     blocks: list[SectionBlock] = []
     current_section = page_title
@@ -99,7 +288,7 @@ def parse_page(path: Path, adm_info_dir: Path) -> tuple[str, str, list[SectionBl
     for line in body.splitlines():
         hm = HEADING_RE.match(line)
         if hm:
-            chunk_text = normalize_markdown("\n".join(current_lines))
+            chunk_text = normalize_markdown("\n".join(current_lines), **norm_kw)
             if chunk_text:
                 blocks.append(SectionBlock(section=current_section, text=chunk_text))
             current_section = hm.group(2).strip()
@@ -107,7 +296,7 @@ def parse_page(path: Path, adm_info_dir: Path) -> tuple[str, str, list[SectionBl
         else:
             current_lines.append(line)
 
-    chunk_text = normalize_markdown("\n".join(current_lines))
+    chunk_text = normalize_markdown("\n".join(current_lines), **norm_kw)
     if chunk_text:
         blocks.append(SectionBlock(section=current_section, text=chunk_text))
 
@@ -115,7 +304,7 @@ def parse_page(path: Path, adm_info_dir: Path) -> tuple[str, str, list[SectionBl
         blocks.append(
             SectionBlock(
                 section=page_title,
-                text=normalize_markdown(body),
+                text=normalize_markdown(body, **norm_kw),
             )
         )
 
@@ -125,17 +314,18 @@ def parse_page(path: Path, adm_info_dir: Path) -> tuple[str, str, list[SectionBl
 def page_to_chunks(
     path: Path,
     adm_info_dir: Path,
+    registry: AdmPageRegistry,
     *,
     target_words: int,
     overlap_words: int,
-) -> list[dict[str, Any]]:
-    page_title, page_url, blocks = parse_page(path, adm_info_dir)
+) -> list[RagChunk]:
+    page_title, page_url, blocks = parse_page(path, adm_info_dir, registry)
     slug = slug_from_path(path, adm_info_dir)
     raw = path.read_text(encoding="utf-8")
     if MOJIBAKE_RE.search(raw):
         log.warning("possible encoding issue: %s", path.relative_to(adm_info_dir))
 
-    chunks: list[dict[str, Any]] = []
+    chunks: list[RagChunk] = []
     part_counter = 0
 
     for block in blocks:
@@ -149,28 +339,23 @@ def page_to_chunks(
             section = block.section
             text = f"{section}\n{part_text}" if part_text else section
             chunks.append(
-                {
-                    "id": f"adm_info_{slug.replace('/', '_')}_{part_counter:05d}",
-                    "text": text.strip(),
-                    "metadata": {
-                        "source": page_url,
-                        "url": page_url,
-                        "page_title": page_title,
-                        "section": section,
-                        "slug": slug,
-                        "part": part_idx,
-                        "parts": len(parts),
-                        "chunk_file": "corpus/adm_info_chunks.jsonl",
-                    },
-                }
+                RagChunk(
+                    id=f"adm_info_{slug.replace('/', '_')}_{part_counter:05d}",
+                    text=text.strip(),
+                    metadata=RagChunkMetadata(
+                        source=page_source_id(page_url, slug),
+                        url=page_url or None,
+                        page_title=page_title,
+                        section=section,
+                        slug=slug,
+                        part=part_idx,
+                        parts=len(parts),
+                        chunk_file="corpus/adm_info_chunks.jsonl",
+                    ),
+                )
             )
 
     return chunks
-
-
-def collect_pages(adm_info_dir: Path) -> list[Path]:
-    pages = sorted(adm_info_dir.glob("**/index.md"))
-    return [p for p in pages if p.name not in SKIP_FILES and p.parent != adm_info_dir or p.name == "index.md"]
 
 
 def main() -> None:
@@ -191,15 +376,18 @@ def main() -> None:
     if not adm_info_dir.is_dir():
         raise SystemExit(f"adm_info dir not found: {adm_info_dir}")
 
-    pages = [p for p in sorted(adm_info_dir.glob("**/index.md")) if p.name not in SKIP_FILES]
-    if adm_info_dir / "index.md" in pages:
-        pages.remove(adm_info_dir / "index.md")
+    pages = collect_markdown_pages(adm_info_dir)
+    if not pages:
+        log.warning("no markdown pages found under %s", adm_info_dir)
 
-    all_chunks: list[dict[str, Any]] = []
+    registry = build_page_registry(pages, adm_info_dir)
+
+    all_chunks: list[RagChunk] = []
     for path in pages:
         page_chunks = page_to_chunks(
             path,
             adm_info_dir,
+            registry,
             target_words=args.target_words,
             overlap_words=args.overlap_words,
         )
@@ -209,7 +397,7 @@ def main() -> None:
     args.out.parent.mkdir(parents=True, exist_ok=True)
     with args.out.open("w", encoding="utf-8") as f:
         for row in all_chunks:
-            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+            f.write(json.dumps(row.to_record(), ensure_ascii=False) + "\n")
 
     log.info("wrote %s chunks to %s", len(all_chunks), args.out)
 

@@ -21,7 +21,7 @@ from src.campus_intent import (
 from src.llm_gate import invoke_with_retry
 from src.pipeline.rag_faiss import rag_context_text
 from src.prompts import build_expand_prompt
-from src.rc.schemas import SearchQueries
+from src.rc.schemas import RagChunk, SearchQueries
 from src.temporal import rc_date_anchor
 
 log = logging.getLogger("s21.pipeline.expand_query")
@@ -76,12 +76,36 @@ def _merge_queries(primary: list[str], extra: list[str], *, limit: int) -> list[
     return out
 
 
+def _short_keyword_queries(subquery: str, lemmas: list[str]) -> list[str]:
+    """1–2 коротких строки для chat.search — как при ручном поиске в RC."""
+    if not lemmas:
+        return []
+
+    keywords: list[str] = []
+    first = lemmas[0]
+    keywords.append(first)
+
+    brand = next(
+        (w for w in lemmas if w in ("сбер", "sber") or "сбер" in w),
+        None,
+    )
+    if brand and brand != first:
+        keywords.append(f"{first} {brand.capitalize() if brand == 'сбер' else brand}")
+
+    if len(keywords) < 2 and len(lemmas) >= 2:
+        pair = f"{lemmas[0]} {lemmas[1]}"
+        if pair.lower() not in {k.lower() for k in keywords}:
+            keywords.append(pair)
+
+    return keywords[:2]
+
+
 def expand_query(
     *,
     llm: GigaChat,
     subquery: str,
     target: int = 3,
-    rag_chunks: list[dict] | None = None,
+    rag_chunks: list[RagChunk] | None = None,
     intent_scope: str | None = None,
 ) -> list[str]:
     lemmas = lemmatize_keywords(subquery)
@@ -128,7 +152,16 @@ def expand_query(
         limit_today = min(8, max(limit, 4) + len(anchors))
         items = _merge_queries(anchors, items, limit=limit_today)
     else:
-        items = items[:limit]
+        short = _short_keyword_queries(subquery, lemmas)
+        items = _merge_queries(short, items, limit=limit)
 
     log.info("expand_query: subquery=%r scope=%s → %s", subquery, scope, items)
     return items
+
+
+def keyword_queries_for_search(subquery: str, expanded: list[str]) -> list[str]:
+    """Короткие строки для phase A / быстрого chat.search."""
+    short = _short_keyword_queries(subquery, lemmatize_keywords(subquery))
+    if short:
+        return short[:2]
+    return expanded[: min(2, len(expanded))]

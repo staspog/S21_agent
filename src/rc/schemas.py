@@ -1,12 +1,12 @@
 """Pydantic v2 схемы для Rocket.Chat пайплайна.
 
 Здесь лежат все типы, которые ходят между узлами LangGraph, а также
-структуры для structured output LLM (decompose, select_rooms, expand_query).
+структуры для structured output LLM (decompose, expand_query).
 """
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -85,31 +85,6 @@ class SubqueryPlan(BaseModel):
         return out[:5]
 
 
-class RoomSelection(BaseModel):
-    """Structured output: выбор комнат для одного подвопроса."""
-
-    selected_rids: list[str] = Field(
-        default_factory=list,
-        description="Идентификаторы комнат (rid), отобранные по релевантности подвопросу",
-    )
-    reasoning: str = Field(
-        default="",
-        description="Короткое обоснование (1–2 фразы), только для логов",
-    )
-
-    @field_validator("selected_rids")
-    @classmethod
-    def _normalize(cls, v: list[str]) -> list[str]:
-        out: list[str] = []
-        seen: set[str] = set()
-        for x in v or []:
-            s = (x or "").strip()
-            if s and s not in seen:
-                seen.add(s)
-                out.append(s)
-        return out[:8]
-
-
 class SearchIntent(BaseModel):
     """Structured output: search intent из истории диалога."""
 
@@ -168,6 +143,59 @@ class SearchQueries(BaseModel):
             seen.add(key)
             out.append(s)
         return out[:6]
+
+
+class RagChunkMetadata(BaseModel):
+    """Метаданные одного RAG-чанка из jsonl/FAISS."""
+
+    model_config = ConfigDict(extra="allow")
+
+    source: str = ""
+    url: str | None = None
+    page_title: str = ""
+    section: str = ""
+    slug: str = ""
+    part: int | None = None
+    parts: int | None = None
+    chunk_file: str = ""
+    rag_ce_score: float | None = None
+
+
+class RagChunk(BaseModel):
+    """Один чанк RAG-корпуса (adm_info / FAQ)."""
+
+    model_config = ConfigDict(extra="allow")
+
+    id: str
+    text: str
+    metadata: RagChunkMetadata = Field(default_factory=RagChunkMetadata)
+
+    @classmethod
+    def from_record(cls, raw: dict[str, Any]) -> RagChunk:
+        data = dict(raw or {})
+        meta = data.pop("metadata", None) or {}
+        if not isinstance(meta, dict):
+            meta = {}
+        chunk_id = str(data.pop("id", "") or "")
+        text = str(data.pop("text", "") or "")
+        return cls(
+            id=chunk_id,
+            text=text,
+            metadata=RagChunkMetadata.model_validate(meta),
+            **data,
+        )
+
+    def to_record(self) -> dict[str, Any]:
+        return self.model_dump(exclude_none=True)
+
+
+class SourceItem(BaseModel):
+    """Источник ответа: permalink Rocket.Chat и человекочитаемая подпись."""
+
+    model_config = ConfigDict(frozen=True)
+
+    url: str
+    label: str
 
 
 class Evidence(BaseModel):
