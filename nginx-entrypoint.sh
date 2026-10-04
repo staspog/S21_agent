@@ -11,6 +11,9 @@ export AGENT_APP_HOST AGENT_APP_PORT
 SSL_DIR="/tmp/nginx-ssl"
 mkdir -p "$SSL_DIR"
 
+# Каталог отдельного access-лога сканеров (обычно проброшен с хоста).
+mkdir -p /var/log/nginx/scanner
+
 if [ -n "$TLS_CERT_PEM_BASE64" ] && [ -n "$TLS_KEY_PEM_BASE64" ]; then
     printf '%s' "$TLS_CERT_PEM_BASE64" | base64 -d > "$SSL_DIR/ssl.crt"
     printf '%s' "$TLS_KEY_PEM_BASE64" | base64 -d > "$SSL_DIR/ssl.key"
@@ -30,6 +33,9 @@ events {
 }
 
 http {
+    # log_format + $scanner_probe/$scanner_hit/$app_traffic
+    include /etc/nginx/scanner-noise.conf;
+
     server {
         listen 8000;
         listen [::]:8000;
@@ -40,6 +46,27 @@ http {
         proxy_read_timeout 300s;
         client_max_body_size 10M;
 
+        # Основной лог без scanner-шума; шум — в отдельный файл.
+        access_log /var/log/nginx/access.log s21_main if=$app_traffic;
+        access_log /var/log/nginx/scanner/scanners.log s21_main if=$scanner_hit;
+
+        # Известные probe рубим до проксирования: приложение их не видит.
+        if ($scanner_probe) {
+            return 444;
+        }
+
+        location = /nginx-health {
+            access_log off;
+            return 200 "ok\n";
+        }
+
+        location /healthz {
+            access_log off;
+            proxy_pass http://${AGENT_APP_HOST}:${AGENT_APP_PORT}/health/live;
+            proxy_connect_timeout 5s;
+            proxy_read_timeout 5s;
+        }
+
         location / {
             proxy_pass http://${AGENT_APP_HOST}:${AGENT_APP_PORT};
             proxy_set_header Host $host;
@@ -47,13 +74,6 @@ http {
             proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
             proxy_set_header X-Forwarded-Proto $scheme;
             proxy_http_version 1.1;
-        }
-
-        location /healthz {
-            access_log off;
-            proxy_pass http://${AGENT_APP_HOST}:${AGENT_APP_PORT}/health;
-            proxy_connect_timeout 5s;
-            proxy_read_timeout 5s;
         }
     }
 }

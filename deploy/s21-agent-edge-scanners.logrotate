@@ -1,0 +1,16 @@
+# Ротация отдельного access-лога scanner-проб edge-nginx.
+# Установка на хосте: sudo cp deploy/s21-agent-edge-scanners.logrotate \
+#     /etc/logrotate.d/s21-agent-edge-scanners
+#
+# copytruncate — чтобы не перезапускать nginx: он продолжает писать в тот же fd.
+/var/log/s21_agent_edge/scanners.log {
+    daily
+    rotate 7
+    maxsize 20M
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+    su root root
+}
