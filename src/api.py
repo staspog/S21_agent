@@ -18,6 +18,7 @@ from .pipeline.rerank import apply_cpu_threads
 apply_cpu_threads()
 
 from fastapi import FastAPI, HTTPException, Request
+from .deployment import DeploymentMiddleware
 from langchain_core.messages import HumanMessage
 from langchain_gigachat.chat_models import GigaChat
 from pydantic import BaseModel, Field
@@ -126,16 +127,22 @@ async def lifespan(app: FastAPI):
         except Exception:
             log.exception("startup: RAG assets preload failed")
 
-    asyncio.create_task(_bg())
+    warmup_task = asyncio.create_task(_bg())
     log.info("API готов к приёму запросов")
     try:
         yield
     finally:
+        warmup_task.cancel()
+        try:
+            await warmup_task
+        except asyncio.CancelledError:
+            pass
         await rc_client.aclose()
         log.info("API остановлен, RC-клиент закрыт")
 
 
 app = FastAPI(title="S21 RC Agent API", lifespan=lifespan)
+app.add_middleware(DeploymentMiddleware)
 
 
 @app.middleware("http")
