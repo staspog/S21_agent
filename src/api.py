@@ -19,6 +19,7 @@ apply_cpu_threads()
 
 from fastapi import FastAPI, HTTPException, Request
 from .deployment import DeploymentMiddleware
+from .log_filters import install_health_access_filter, quiet_health_request
 from langchain_core.messages import HumanMessage
 from langchain_gigachat.chat_models import GigaChat
 from pydantic import BaseModel, Field
@@ -47,6 +48,7 @@ def _setup_logging() -> None:
 
 
 _setup_logging()
+install_health_access_filter()
 log = logging.getLogger("s21.api")
 
 api_key = os.getenv("GIGACHAT_API_KEY")
@@ -150,13 +152,14 @@ async def log_http_requests(request: Request, call_next):
     start = time.perf_counter()
     response = await call_next(request)
     elapsed = time.perf_counter() - start
-    log.info(
-        "%s %s -> %s in %.3fs",
-        request.method,
-        request.url.path,
-        response.status_code,
-        elapsed,
-    )
+    if not quiet_health_request(request.method, request.url.path, response.status_code):
+        log.info(
+            "%s %s -> %s in %.3fs",
+            request.method,
+            request.url.path,
+            response.status_code,
+            elapsed,
+        )
     return response
 
 
