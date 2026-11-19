@@ -95,8 +95,8 @@ def _invoke_search_intent(
             ],
             label="resolve_query",
         )
-    except Exception:
-        log.exception("resolve_query: LLM failed")
+    except Exception as exc:
+        log.warning("resolve_query: LLM failed error_type=%s", type(exc).__name__)
         return None
 
 
@@ -117,9 +117,8 @@ def resolve_search_intent(
     if contextual_q:
         scope = infer_search_scope(contextual_q)
         log.info(
-            "resolve_query: contextual follow-up scope=%s → %r",
+            "resolve_query: contextual follow-up scope=%s",
             scope,
-            contextual_q,
         )
         return contextual_q, scope
 
@@ -127,9 +126,8 @@ def resolve_search_intent(
     if followup_q:
         scope = infer_search_scope(followup_q)
         log.info(
-            "resolve_query: affirmative follow-up scope=%s → %r",
+            "resolve_query: affirmative follow-up scope=%s",
             scope,
-            followup_q,
         )
         return followup_q, scope
 
@@ -139,11 +137,10 @@ def resolve_search_intent(
         scope = result.scope or "general"
         if q:
             log.info(
-                "resolve_query: turns=%s scope=%s meta_last=%s → %r",
+                "resolve_query: turns=%s scope=%s meta_last=%s",
                 len(humans),
                 scope,
                 is_meta_search_command(last),
-                q,
             )
             return q, scope
 
@@ -152,7 +149,7 @@ def resolve_search_intent(
         parts = humans[:-1] if is_meta_search_command(last) and len(humans) > 1 else humans
     fallback = " ".join(parts[-3:]).strip() or last
     scope = infer_search_scope(fallback)
-    log.info("resolve_query: fallback scope=%s → %r", scope, fallback)
+    log.info("resolve_query: fallback scope=%s", scope)
     return fallback, scope
 
 

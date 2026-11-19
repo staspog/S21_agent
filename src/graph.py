@@ -67,6 +67,7 @@ class AgentState(MessagesState):
     seed_rooms: NotRequired[list[Room]]
     evidence: Annotated[list[Evidence], operator.add]
     final_sources: NotRequired[list[dict[str, str]]]
+    personal_context: NotRequired[dict | None]
 
 
 def _rag_chunks_from_state(raw: list | None) -> list[RagChunk]:
@@ -207,7 +208,6 @@ def build_rc_graph(
             "prepare",
             t0,
             rag_chunks=len(rag_chunks),
-            search_intent=search_intent[:80] if search_intent else "",
             search_scope=search_scope,
             rooms=len(rooms),
             seeds=len(seeds),
@@ -311,7 +311,7 @@ def build_rc_graph(
         search_scope = (payload.get("search_scope") or "general").strip()
         deep = bool(payload.get("deep_search"))
         profile = rc_cfg.profile_for(deep=deep)
-        log.info("per_subquery: start q=%r deep=%s", subquery, deep)
+        log.info("per_subquery: start deep=%s", deep)
 
         loop = asyncio.get_running_loop()
 
@@ -356,7 +356,7 @@ def build_rc_graph(
             log.info(
                 "per_subquery: phase_a rooms=%s queries=%s hits=%s",
                 [r.name for r in adm_rooms],
-                keyword_queries,
+                len(keyword_queries),
                 phase_a_hits,
             )
             if phase_a_hits:
@@ -405,12 +405,11 @@ def build_rc_graph(
         _log_node_done(
             "per_subquery",
             t0,
-            q=subquery[:40],
             hits=len(with_threads),
             mode=profile.rerank_mode,
             phase=phase,
             rooms=[r.name for r in rooms],
-            queries=queries,
+            queries=len(queries),
         )
         return {"evidence": [Evidence(subquery=subquery, hits=with_threads)]}
 
@@ -430,6 +429,13 @@ def build_rc_graph(
     async def node_generate(state: AgentState) -> dict:
         t0 = time.perf_counter()
         log.info("graph: generate start")
+        personal = state.get("personal_context")
+        if personal is not None and personal.get("status") != "ok":
+            return {"messages": [AIMessage(content="Сейчас не удалось получить ваши данные с платформы. Попробуйте позже.")], "final_sources": []}
+        if personal is not None and personal.get("kind") == "calendar" and personal.get("items") == []:
+            return {"messages": [AIMessage(content="В календаре Школы 21 на выбранный день записей нет.")], "final_sources": []}
+        if personal is not None and personal.get("kind") == "projects" and personal.get("projects") == []:
+            return {"messages": [AIMessage(content="Платформа не вернула текущих проектов.")], "final_sources": []}
         question = _last_human_text(list(state["messages"]))
         rocket = bool(state.get("rocket_search"))
         rc_unavailable = bool(state.get("rc_unavailable"))
@@ -454,6 +460,7 @@ def build_rc_graph(
                 reference_topic=reference_topic,
                 reference_campus=reference_campus,
                 rag_first=bool(state.get("rag_first")),
+                personal_context=state.get("personal_context"),
             ),
         )
         _log_node_done(

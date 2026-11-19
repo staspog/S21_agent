@@ -55,13 +55,14 @@ class RocketChatAvailability:
         async with self._lock:
             if not force and self._cache_fresh():
                 return self._available, self._error
+            previous = self._available
             ok, err = await self._probe(client)
             self._available = ok
             self._error = err
             self._checked_at = time.time()
-            if ok:
-                log.info("RC availability: ok")
-            else:
+            if ok and previous is False:
+                log.info("RC availability: recovered")
+            elif not ok:
                 log.warning("RC availability: unavailable (%s)", err)
             return ok, err
 

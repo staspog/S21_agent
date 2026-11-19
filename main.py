@@ -22,6 +22,7 @@ def main() -> None:
         host=host,
         port=port,
         reload=reload,
+        timeout_graceful_shutdown=300,
     )
 
 

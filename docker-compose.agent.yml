@@ -9,6 +9,7 @@ services:
       - "8000"
     environment:
       - GIGACHAT_API_KEY=${GIGACHAT_API_KEY:-}
+      - S21_SERVER_API_BASE=${S21_SERVER_API_BASE:-https://s21-api.gabrielg.ru}
       - ROCKETCHAT_BASE_URL=${ROCKETCHAT_BASE_URL:-}
       - ROCKETCHAT_USER=${ROCKETCHAT_USER:-}
       - ROCKETCHAT_PASSWORD=${ROCKETCHAT_PASSWORD:-}

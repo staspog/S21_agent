@@ -201,12 +201,15 @@ docker compose -f docker-compose.agent.yml up -d --build
 
 - `POST /ask` — вопрос пользователя.
 
+  Требуется `Authorization: Bearer <platform token>`; токен проверяется через API и платформу. `S21_SERVER_API_BASE` задаёт адрес API (по умолчанию `https://s21-api.gabrielg.ru`). Для личных вопросов агент использует MCP endpoint `/v1/assistant/mcp` API-сервиса. Выпуск API с `/v1/assistant/identity` и MCP должен предшествовать выпуску агента.
+
   Body:
 
   ```json
   {
     "question": "...",
     "session_id": "...",
+    "timezone": "Europe/Moscow",
     "include_sources": true,
     "rocket_search": false,
     "deep_search": false

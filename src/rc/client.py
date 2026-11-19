@@ -27,6 +27,7 @@ class RocketChatClient:
         self._user_id: str | None = None
         self._auth_token: str | None = None
         self._auth_lock = asyncio.Lock()
+        self._has_authenticated = False
         timeout = httpx.Timeout(
             connect=cfg.timeout_connect_s,
             read=cfg.timeout_read_s,
@@ -76,7 +77,9 @@ class RocketChatClient:
             d = data["data"]
             self._user_id = str(d["userId"])
             self._auth_token = str(d["authToken"])
-            log.info("RC login ok user_id=%s", self._user_id)
+            reason = "after_401" if self._has_authenticated else "initial"
+            self._has_authenticated = True
+            log.info("RC authentication succeeded component=agent reason=%s", reason)
             return self._user_id, self._auth_token
 
     async def _auth_headers(self) -> dict[str, str]:
@@ -236,16 +239,13 @@ class RocketChatClient:
             )
         except httpx.TimeoutException:
             log.warning(
-                "RC chat.search timeout room=%s q=%r limit_s=%s",
+                "RC chat.search timeout room=%s limit_s=%s",
                 room.name,
-                search_text,
                 self._cfg.search_timeout_s,
             )
             return []
-        except Exception:
-            log.exception(
-                "RC chat.search failed room=%s q=%r", room.name, search_text
-            )
+        except Exception as exc:
+            log.warning("RC chat.search failed room=%s error_type=%s", room.name, type(exc).__name__)
             return []
         if not data.get("success", True):
             log.warning(
