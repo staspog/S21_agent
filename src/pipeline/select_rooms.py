@@ -133,15 +133,14 @@ def select_rooms(
     cap = max(1, int(target))
     base = list(seed_rooms) if seed_rooms else list(catalog)
     if not base:
-        log.warning("select_rooms: пустой seed/catalog для subquery=%r", subquery[:60])
+        log.warning("select_rooms: пустой seed/catalog")
         return []
 
     priority = _priority_room_names(subquery)
     ordered = _order_rooms(base, priority)
     chosen = ordered[:cap]
     log.info(
-        "select_rooms: subquery=%r → %s rooms (cap=%s): %s",
-        subquery[:60],
+        "select_rooms: %s rooms (cap=%s): %s",
         len(chosen),
         cap,
         ", ".join(r.name for r in chosen),

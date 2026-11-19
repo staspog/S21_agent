@@ -83,8 +83,8 @@ def decompose_question(
             label="decompose",
         )
         items = list(result.subqueries or [])
-    except Exception:
-        log.exception("decompose: structured_output failed, fallback to single subquery")
+    except Exception as exc:
+        log.warning("decompose: structured_output failed error_type=%s, fallback to single subquery", type(exc).__name__)
         items = []
 
     if not items:
@@ -92,8 +92,7 @@ def decompose_question(
 
     items = items[: max(1, max_subqueries)]
     log.info(
-        "decompose: %s подвопросов: %s",
+        "decompose: %s подвопросов",
         len(items),
-        " | ".join(items),
     )
     return items

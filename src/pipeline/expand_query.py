@@ -136,8 +136,8 @@ def expand_query(
         )
         scope = sq.scope or "general"
         items = list(sq.queries or [])
-    except Exception:
-        log.exception("expand_query: structured_output failed, fallback к леммам")
+    except Exception as exc:
+        log.warning("expand_query: structured_output failed error_type=%s, fallback к леммам", type(exc).__name__)
 
     if intent_scope == "today":
         scope = "today"
@@ -155,7 +155,7 @@ def expand_query(
         short = _short_keyword_queries(subquery, lemmas)
         items = _merge_queries(short, items, limit=limit)
 
-    log.info("expand_query: subquery=%r scope=%s → %s", subquery, scope, items)
+    log.info("expand_query: scope=%s queries=%s", scope, len(items))
     return items
 
 

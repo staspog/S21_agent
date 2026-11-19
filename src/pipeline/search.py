@@ -44,19 +44,17 @@ async def search_rooms_x_queries(
             )
         except TimeoutError:
             log.warning(
-                "search: timeout room=%s q=%r limit_s=%s",
+                "search: timeout room=%s limit_s=%s",
                 room.name,
-                q,
                 timeout_s,
             )
             return []
-        except Exception:
-            log.exception("search: failed room=%s q=%r", room.name, q)
+        except Exception as exc:
+            log.warning("search: failed room=%s error_type=%s", room.name, type(exc).__name__)
             return []
         log.info(
-            "search: room=%s q=%r → %s hits",
+            "search: room=%s → %s hits",
             room.name,
-            q,
             len(hits),
         )
         return hits
@@ -67,7 +65,7 @@ async def search_rooms_x_queries(
     for item in raw:
         if isinstance(item, BaseException):
             errors += 1
-            log.warning("search: pair failed: %s", item)
+            log.warning("search: pair failed error_type=%s", type(item).__name__)
             out.append([])
         else:
             out.append(item)

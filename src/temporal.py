@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import os
 from datetime import datetime
-from functools import lru_cache
 from zoneinfo import ZoneInfo
 
 _WEEKDAYS_RU = (
@@ -42,14 +41,9 @@ def agent_timezone() -> ZoneInfo:
         return ZoneInfo("Europe/Moscow")
 
 
-@lru_cache(maxsize=8)
-def _now_cached(tz_name: str) -> datetime:
-    return datetime.now(ZoneInfo(tz_name))
-
-
 def now() -> datetime:
     tz = agent_timezone()
-    return _now_cached(tz.key)
+    return datetime.now(tz)
 
 
 def rc_date_anchor() -> str:

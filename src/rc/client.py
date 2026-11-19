@@ -239,16 +239,13 @@ class RocketChatClient:
             )
         except httpx.TimeoutException:
             log.warning(
-                "RC chat.search timeout room=%s q=%r limit_s=%s",
+                "RC chat.search timeout room=%s limit_s=%s",
                 room.name,
-                search_text,
                 self._cfg.search_timeout_s,
             )
             return []
-        except Exception:
-            log.exception(
-                "RC chat.search failed room=%s q=%r", room.name, search_text
-            )
+        except Exception as exc:
+            log.warning("RC chat.search failed room=%s error_type=%s", room.name, type(exc).__name__)
             return []
         if not data.get("success", True):
             log.warning(
